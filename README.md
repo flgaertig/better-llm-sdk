@@ -1,70 +1,94 @@
-🚀 Universal LLM API Wrapper
-A robust and flexible Python wrapper designed to interact with any Large Language Model (LLM) server that exposes an OpenAI-compatible API, such as LM Studio, vLLM, OLLAMA, or even the official OpenAI service.
+# 🚀 Universal LLM API Wrapper
 
-It simplifies advanced tasks like streaming output, multi-modal input (vision models), and function/tool calling.
+A versatile Python wrapper built on the official `openai-python` SDK. It is designed to interface with any Large Language Model (LLM) server that exposes an **OpenAI-compatible API** (e.g., local servers like LM Studio, vLLM, etc., or remote services).
 
-✨ Features
-Universal Compatibility: Connects to any endpoint via base_url (defaults to LM Studio).
+This wrapper focuses on simplifying advanced tasks and local development.
 
-Streaming Support: Efficiently processes and yields chunks for real-time output.
+### ✨ Key Features
 
-Tool Calling: Accumulates and reconstructs fragmented tool call data from the stream.
+* **OpenAI API Compatibility:** Uses the standard `openai.OpenAI` client with configurable `base_url` and `api_key` in the constructor.
+* **Streaming Output:** Implements a streaming generator to process responses in chunks, separating them into **"answer"**, **"reasoning"**, and **"tool_call"** types.
+* **Tool/Function Calling:** Accumulates and reconstructs fragmented tool call information from the stream, including the function name and JSON arguments.
+* **Multimodal Support (`vllm_mode`):** When enabled, it converts local image sources (paths via `"image_path"` or PIL objects via `"image_pil"`) into **Base64-encoded data URLs**, compatible with multimodal LLMs that follow the OpenAI Vision format.
+* **Reasoning/CoT Extraction:** Separates internal thinking from the main response by detecting and processing content between custom **`<think>`** and **`</think>`** tags.
+* **LM Studio Unloading (Optional):** Includes specific logic (`lm_studio_unload=True`) using the `lmstudio` package to automatically check and unload other loaded models to prepare for the configured model.
 
-Multimodal (V-LLM) Ready: Converts local image paths (image_path) and PIL objects (image_pil) into the required Base64 data URL format.
+### ⬇️ Dependencies
 
-Reasoning Extraction: Parses <think> tags (if emitted by the model) to separate internal reasoning from the final answer.
+This project requires the `openai` SDK and `Pillow` for image handling:
 
-LM Studio Integration: Optional feature to unload currently loaded models to free up VRAM before making a request to the configured model.
-
-⬇️ Installation
-This wrapper requires the following core dependencies:
-
-Bash
-
+```bash
 pip install openai pillow
-If you plan to use the lm_studio_unload=True feature, you'll also need:
-
-Bash
-
+```
+If you plan to use the lm_studio_unload_model=True feature, you'll also need:
+```bash
 pip install lmstudio
-🧑‍💻 Usage Example
-The LLM class is initialized with the model name, and the base_url and api_key can be configured for any compatible server.
+```
 
-Python
+### 🧑‍💻 Usage Example
+The LLM class is initialized with the model name, the base_url and api_key can be configured for any compatible server.
 
-from llm_wrapper import LLM # Assuming you save your class in llm_wrapper.py
+#### 1. Initialize the Wrapper
+```python
+from llm_wrapper import LLM
 
-# 1. Initialize for a local server (e.g., LM Studio default)
 llm = LLM(
-    model="TheBloke/My-Awesome-Model-GGUF", 
-    base_url="http://localhost:1234/v1",
-    vllm_mode=True # Enable image path/PIL object conversion
+    model="qwen3-vl-4b-thinking", 
+    vllm_mode=True, # Enable local image handling (e.g., image_path)
+    base_url="your base url", #(defaults to LM Studio settings)
+    api_key="your api key", #(defaults to LM Studio settings)
 )
+```
 
-# 2. Define a multi-content message (text and image path)
-# Note: For multimodal models, the message content must be a list.
+#### 2. Get response
+```
 messages = [
     {
         "role": "user",
         "content": [
-            {"type": "text", "text": "What color is the cat in this image?"},
-            {"type": "image", "image_path": "/path/to/your/cat_picture.jpg"}
+            {"type": "text", "text": "Solve the problem 2+2*3"}
         ]
     }
 ]
+response = llm.response(messages=messages)
+print(response)
+```
 
-# 3. Stream the response
-print("LLM Response (Streaming):\n---")
-for chunk in llm.response(messages=messages, stream=True, lm_studio_unload=False):
-    # Print the streamed answer content
-    if chunk["type"] == "answer":
-        print(chunk["content"], end = "", flush=True)
+#### 3. Image Input
+```
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Solve the problem in the picture"}
+            {"type": "image", "image_path":"your local image path"}
+            # {"type": "image", "image_url":"your image url"}
+            # {"type": "image", "image_pil":"your PIL Image object"}
+        ]
+    }
+]
+response = llm.response(messages=messages)
+print(response)
+```
 
-print("\n\n--- End of Stream ---")
-🚨 Robustness and Error Handling
-The wrapper utilizes the exception handling of the openai client. If a network issue, server error, or invalid model name is encountered, the generator will yield an {"type": "error", "content": "..."} chunk before terminating.
+#### 4. Streaming
+```
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Solve the problem 2+2*3"}
+        ]
+    }
+]
+response = llm.response(
+    messages=messages,
+    stream=True,
+    # final=True # includes a final chunk with answer, reasoning and tool calls in one piece
+)
+for chunk in response:
+    print(chunk["content"], end = "",flush=True)
+```
 
-Important Note on LM Studio: The lm_studio_unload=True feature requires the separate lmstudio Python package. If this package is not installed and the feature is requested, the wrapper will print a warning and automatically skip the unloading logic.
-
-📄 License
-This project is licensed under the MIT License. See the LICENSE file for details.
+### 📄 License
+This project is licensed under the **MIT License**. See the `LICENSE` file for details.
