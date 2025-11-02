@@ -131,17 +131,3 @@ class LLM:
                 "reasoning": thinking,
                 "tool_calls": final_tool_calls
             }
-
-llm = LLM(model="openai/gpt-oss-20b")
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "löse die aufgabe 2+2*3"},
-            #{"type": "image_url", "image_url": "bild.png"}
-        ]
-    }
-]
-
-for chunk in llm.response(messages):
-    print(chunk["content"], end = "",flush=True)
