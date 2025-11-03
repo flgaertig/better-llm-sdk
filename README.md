@@ -124,6 +124,7 @@ tools = [
 response = llm.response(messages=messages, tools=tools)
 print(response)
 ```
+---
 
 ### 6️⃣ Structured Output
 ```python
