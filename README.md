@@ -46,7 +46,7 @@ messages = [
     {"role": "user", "content": [{"type": "text", "text": "Solve 2+2*3"}]}
 ]
 response = llm.response(messages=messages)
-print(response)
+print(response["answer"])
 ```
 
 **Output:**
