@@ -119,17 +119,19 @@ class LLM:
         if stream:
             if final:
                 yield {"type": "final", "content": {
-                "answer": answer,
-                "reasoning": thinking,
-                "tool_calls": final_tool_calls
-            }}
+                    "reasoning": thinking,
+                    "answer": answer,
+                    "tool_calls": final_tool_calls
+                    }    
+                }
             yield {"type": "done", "content": None}
 
         if not stream:
             return {
-                "answer": answer,
                 "reasoning": thinking,
+                "answer": answer,
                 "tool_calls": final_tool_calls
             }
+
 
 
