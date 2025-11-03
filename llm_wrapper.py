@@ -13,13 +13,36 @@ class LLM:
         self.model = model
         self.vllm_mode = vllm_mode
 
-    def response(self,messages:list[dict[str, Any]]=None,stream:bool=False,final:bool=False,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False):
+    def response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False):
         """request model inference"""
+
+        if messages is None:
+            raise ValueError("messages must be provided")
+        
+        response = self.stream_response(
+            messages=messages,
+            output_format=output_format,
+            final=True,
+            tools=tools,
+            lm_studio_unload_model=lm_studio_unload_model
+        )
+
+        for r in response:
+            if r["type"] == "final":
+                return r["content"]
+                
+
+    def stream_response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,final:bool=False,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False):
+        """request model inference"""
+
+        if messages is None:
+            raise ValueError("messages must be provided")
+
         if self.vllm_mode:
             for msg in messages:
                 for i in range(len(msg["content"])):
                     c = msg["content"][i]
-                    if c.get("type") == "image":
+                    if c["type"] == "image":
                         if "image_path" in c:
                             img = Image.open(c["image_path"])
                             buffer = io.BytesIO()
@@ -59,6 +82,7 @@ class LLM:
                 messages=messages,
                 stream=True,
                 tools=tools if tools is not None else [],
+                response_format=output_format if output_format is not None else None,
             )
         except Exception as e:
             raise RuntimeError(f"Model request failed: {e}")
@@ -68,8 +92,12 @@ class LLM:
         tool_calls_accumulator = {}
         inside_think = False
 
+        structured_output = output_format is not None
+
         for chunk in completion:
             x = chunk.choices[0].delta
+            if not x:
+                continue
 
             reasoning = getattr(x, "reasoning", None)
             content = getattr(x, "content", None)
@@ -87,17 +115,15 @@ class LLM:
                     content = content.replace("</think>", "")
                 if inside_think:
                     thinking += content
-                    if stream:
-                        yield {"type": "reasoning", "content": content}
+                    yield {"type": "reasoning", "content": content}
                 else:
                     answer += content
-                    if stream:
+                    if not structured_output:
                         yield {"type": "answer", "content": content}
 
             if reasoning:
                 thinking += reasoning
-                if stream:
-                    yield {"type": "reasoning", "content": reasoning}
+                yield {"type": "reasoning", "content": reasoning}
                 
             if tool_calls:
                 for tool_call in tool_calls:
@@ -110,6 +136,19 @@ class LLM:
                     if func.arguments:
                         tool_calls_accumulator[tool_id]["arguments"] += func.arguments
 
+        if structured_output:
+            temp_answer = answer
+            try:
+                data = json.loads(answer)
+            except json.JSONDecodeError:
+                try:
+                    decoded = answer.encode('utf-8').decode('unicode_escape')
+                    data = json.loads(decoded)
+                except Exception:
+                    data = temp_answer
+            answer = data
+            yield {"type": "answer", "content": answer}
+
         final_tool_calls = []
         for tool_id, data in tool_calls_accumulator.items():
             try:
@@ -119,22 +158,27 @@ class LLM:
             final_tool_calls.append({"id": tool_id, "name": data["name"], "arguments": args})
 
         for tool_call in final_tool_calls:
-            if stream:
-                yield {"type": "tool_call", "content": tool_call}
+            yield {"type": "tool_call", "content": tool_call}
 
-        if stream:
-            if final:
-                yield {"type": "final", "content": {
-                    "reasoning": thinking,
-                    "answer": answer,
-                    "tool_calls": final_tool_calls
-                    }    
-                }
-            yield {"type": "done", "content": None}
-
-        if not stream:
-            return {
+        if final:
+            yield {"type": "final", "content": {
                 "reasoning": thinking,
                 "answer": answer,
                 "tool_calls": final_tool_calls
+                }    
             }
+        yield {"type": "done", "content": None}
+    
+    def lm_studio_count_tokens(self,input_text: str) -> int:
+        """count tokens used in lm studio"""
+        import lmstudio as lms
+        lms.configure_default_client("localhost:1234")
+        model = lms.llm(self.model)
+        token_count = len(model.tokenize(input_text))
+        return token_count
+    
+    def lm_studio_get_context_length(self) -> int:
+        import lmstudio as lms
+        lms.configure_default_client("localhost:1234")
+        model = lms.llm(self.model)
+        return model.get_context_length()
