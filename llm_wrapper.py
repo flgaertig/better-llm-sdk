@@ -5,13 +5,15 @@ import io
 from PIL import Image
 
 class LLM:
+    """Universal LLM API Wrapper compatible with OpenAI-style APIs."""
     def __init__(self,model:str, vllm_mode:bool=False, api_key:str="lm-studio", base_url:str="http://localhost:1234/v1"):
+        """initialize the wrapper"""
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
         self.vllm_mode = vllm_mode
 
     def response(self,messages:list=None,stream:bool=False,final:bool=False,tools:list=None,lm_studio_unload_model:bool=True):
-
+        """request model inference"""
         if self.vllm_mode:
             for msg in messages:
                 for i in range(len(msg["content"])):
@@ -132,6 +134,7 @@ class LLM:
                 "answer": answer,
                 "tool_calls": final_tool_calls
             }
+
 
 
 
