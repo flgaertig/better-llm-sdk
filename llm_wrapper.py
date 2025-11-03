@@ -76,23 +76,34 @@ class LLM:
                     model = lms.llm(loaded_model)
                     model.unload()
 
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stream=True,
-                tools=tools if tools is not None else [],
-                response_format=output_format if output_format is not None else None,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Model request failed: {e}")
+        structured_output = output_format is not None
+
+        if structured_output:
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    tools=tools if tools is not None else [],
+                    response_format=output_format if output_format is not None else None,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Model request failed: {e}")
+        else:
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    tools=tools if tools is not None else [],
+                )
+            except Exception as e:
+                raise RuntimeError(f"Model request failed: {e}")
 
         thinking = ""
         answer = ""
         tool_calls_accumulator = {}
         inside_think = False
-
-        structured_output = output_format is not None
 
         for chunk in completion:
             x = chunk.choices[0].delta
@@ -182,3 +193,4 @@ class LLM:
         lms.configure_default_client("localhost:1234")
         model = lms.llm(self.model)
         return model.get_context_length()
+
