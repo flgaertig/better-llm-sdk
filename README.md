@@ -26,15 +26,13 @@ pip install lmstudio
 ```
 
 ### 🧑‍💻 Usage Example
-The LLM class is initialized with the model name, the base_url and api_key can be configured for any compatible server.
 
 #### 1. Initialize the Wrapper
 ```python
 from llm_wrapper import LLM
 
 llm = LLM(
-    model="qwen3-vl-4b-thinking", 
-    vllm_mode=True, # Enable local image handling (e.g., image_path)
+    model="openai/gpt-oss-20b",
     base_url="your base url", #(defaults to LM Studio settings)
     api_key="your api key", #(defaults to LM Studio settings)
 )
@@ -54,8 +52,18 @@ response = llm.response(messages=messages)
 print(response)
 ```
 
+#### Response Format
+```
+chunk = {"type":"reasoning/answer/tool_call","content":"your content"}
+```
+
 #### 3. Image Input
 ```
+llm = LLM(
+    model="qwen3-vl-4b-thinking", 
+    vllm_mode=True, # Enable local image handling (e.g., image_path)
+)
+
 messages = [
     {
         "role": "user",
@@ -67,6 +75,7 @@ messages = [
         ]
     }
 ]
+
 response = llm.response(messages=messages)
 print(response)
 ```
@@ -88,6 +97,46 @@ response = llm.response(
 )
 for chunk in response:
     print(chunk["content"], end = "",flush=True)
+```
+#### Chunk Format
+```
+chunk = {"type":"reasoning/answer/tool_call","content":"your content"}
+```
+
+#### 5. LM Studio Model Unload
+```
+response = llm.response(
+    messages=messages,
+    lm_studio_model_unload = True, # unloads other models to save memory
+)
+print(response)
+```
+
+#### 6. Using TOOLS
+```
+tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_sum",
+                    "description": "Get sum of two numbers",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "number"},
+                            "b": {"type": "number"},
+                        },
+                        "required": ["a", "b"]
+                    },
+                }
+            }
+        ]
+
+response = llm.response(
+    messages=messages,
+    tools=tools
+)
+print(response)
 ```
 
 ### 📄 License
