@@ -130,7 +130,7 @@ print(response)
 | `base_url` | `str` | `"http://localhost:1234/v1"` | OpenAI-compatible endpoint |
 | `api_key` | `str` | `"lm-studio"` | API key (if required) |
 | `vllm_mode` | `bool` | `False` | Enable local image handling for multimodal inputs |
-| `lm_studio_unload_model` | `bool` | `True` | Automatically unload other models in LM Studio |
+| `lm_studio_unload_model` | `bool` | `False` | Automatically unload other models in LM Studio |
 | `stream` | `bool` | `False` | Return generator chunks instead of a full dict |
 | `final` | `bool` | `False` | Add a final summary chunk at end of stream |
 
