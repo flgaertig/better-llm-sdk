@@ -64,7 +64,7 @@ print(response)
 ```python
 for chunk in llm.stream_response(
     messages=messages,
-    final=True # includes a `"type":"final"` chunk with reasoning, answer, tool_calls 
+    final=True # includes a "type":"final" chunk with reasoning, answer, tool_calls 
 ):
     print(chunk["content"])
 ```
