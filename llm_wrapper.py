@@ -41,12 +41,12 @@ class LLM:
                                 url_data = {"url": url_data}
                             msg["content"][i] = {"type": "image_url", "image_url": url_data}
         
-        if lm_studio_unload_model:
+        if lm_studio_unload:
             import lmstudio as lms
             lms.configure_default_client("localhost:1234")
             all_loaded_models = lms.list_loaded_models()
-            if self.model not in all_loaded_models:
-                for loaded_model in all_loaded_models:
+            for loaded_model in all_loaded_models:
+                if loaded_model != self.model:
                     model = lms.llm(loaded_model)
                     model.unload()
 
@@ -131,4 +131,5 @@ class LLM:
                 "reasoning": thinking,
                 "tool_calls": final_tool_calls
             }
+
 
