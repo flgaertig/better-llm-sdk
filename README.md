@@ -1,6 +1,6 @@
 # 🚀 Universal LLM API Wrapper
 
-A versatile Python wrapper built on the official `openai` SDK — designed to interface with **any OpenAI-compatible LLM API**, such as **LM Studio**, **vLLM**, or other self-hosted services.
+A versatile Python wrapper built on the official `openai` SDK — designed to interface with **any OpenAI-compatible LLM API**, such as **LM Studio**, **Ollama**, or other self-hosted services.
 
 This wrapper simplifies advanced workflows (streaming, multimodal input, function calling, reasoning extraction, etc.) for both **local** and **remote** development.
 
@@ -62,13 +62,16 @@ print(response)
 
 ### 3️⃣ Streaming Responses
 ```python
-for chunk in llm.response(messages=messages, stream=True, final=True):
-    print(chunk)
+for chunk in llm.stream_response(
+    messages=messages,
+    final=True # includes a `"type":"final"` chunk with reasoning, answer, tool_calls 
+):
+    print(chunk["content"])
 ```
 
 **Chunk examples:**
 ```python
-{"type": "reasoning", "content": "Thinking..."}
+{"type": "reasoning", "content": "CoT if reasoning model"}
 {"type": "answer", "content": "8"}
 {"type": "tool_call", "content": {...}}
 {"type": "final", "content": {...}}
@@ -85,7 +88,9 @@ messages = [
         "role": "user",
         "content": [
             {"type": "text", "text": "What’s in this picture?"},
-            {"type": "image", "image_path": "example.png"}
+            {"type": "image", "image_path": "example.png"},
+            #{"type": "image", "image_url": "example.com/image.png"}
+            #{"type": "image", "image_pil": PIL Image object}
         ]
     }
 ]
@@ -120,6 +125,29 @@ response = llm.response(messages=messages, tools=tools)
 print(response)
 ```
 
+### 6️⃣ Structured Output
+```python
+output_format = {
+    "type": "json_schema",
+    "json_schema": {
+        "schema":{
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+            },
+            "required": [
+                "name"
+            ]
+        }
+    }
+}
+
+response = llm.response(messages=messages, output_format=output_format)
+print(response)
+```
+
 ---
 
 ## ⚙️ Parameters Overview
@@ -131,7 +159,6 @@ print(response)
 | `api_key` | `str` | `"lm-studio"` | API key (if required) |
 | `vllm_mode` | `bool` | `False` | Enable local image handling for multimodal inputs |
 | `lm_studio_unload_model` | `bool` | `False` | Automatically unload other models in LM Studio |
-| `stream` | `bool` | `False` | Return generator chunks instead of a full dict |
 | `final` | `bool` | `False` | Add a final summary chunk at end of stream |
 
 ---
