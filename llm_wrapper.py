@@ -13,7 +13,7 @@ class LLM:
         self.model = model
         self.vllm_mode = vllm_mode
 
-    def response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False):
+    def response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False,hide_thinking:bool=True):
         """request model inference"""
 
         if messages is None:
@@ -24,15 +24,15 @@ class LLM:
             output_format=output_format,
             final=True,
             tools=tools,
-            lm_studio_unload_model=lm_studio_unload_model
+            lm_studio_unload_model=lm_studio_unload_model,
+            hide_thinking=hide_thinking,
         )
 
         for r in response:
             if r["type"] == "final":
                 return r["content"]
                 
-
-    def stream_response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,final:bool=False,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False):
+    def stream_response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,final:bool=False,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False,hide_thinking:bool=True):
         """request model inference"""
 
         if messages is None:
@@ -105,6 +105,8 @@ class LLM:
         tool_calls_accumulator = {}
         inside_think = False
 
+        
+
         for chunk in completion:
             x = chunk.choices[0].delta
             if not x:
@@ -126,7 +128,8 @@ class LLM:
                     content = content.replace("</think>", "")
                 if inside_think:
                     thinking += content
-                    yield {"type": "reasoning", "content": content}
+                    if not hide_thinking:
+                        yield {"type": "reasoning", "content": content}
                 else:
                     answer += content
                     if not structured_output:
@@ -134,7 +137,8 @@ class LLM:
 
             if reasoning:
                 thinking += reasoning
-                yield {"type": "reasoning", "content": reasoning}
+                if not hide_thinking:
+                    yield {"type": "reasoning", "content": reasoning}
                 
             if tool_calls:
                 for tool_call in tool_calls:
@@ -172,12 +176,19 @@ class LLM:
             yield {"type": "tool_call", "content": tool_call}
 
         if final:
-            yield {"type": "final", "content": {
-                "reasoning": thinking,
-                "answer": answer,
-                "tool_calls": final_tool_calls
-                }    
-            }
+            if not hide_thinking:
+                yield {"type": "final", "content": {
+                    "reasoning": thinking,
+                    "answer": answer,
+                    "tool_calls": final_tool_calls
+                    }    
+                }
+            else:
+                yield {"type": "final", "content": {
+                    "answer": answer,
+                    "tool_calls": final_tool_calls
+                    }    
+                }
         yield {"type": "done", "content": None}
     
     def lm_studio_count_tokens(self,input_text: str) -> int:
@@ -193,4 +204,3 @@ class LLM:
         lms.configure_default_client("localhost:1234")
         model = lms.llm(self.model)
         return model.get_context_length()
-
