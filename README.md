@@ -1,155 +1,142 @@
 # 🚀 Universal LLM API Wrapper
 
-A versatile Python wrapper built on the official `openai-python` SDK. It is designed to interface with any Large Language Model (LLM) server that exposes an **OpenAI-compatible API** (e.g., local servers like LM Studio, vLLM, etc., or remote services).
+A versatile Python wrapper built on the official `openai` SDK — designed to interface with **any OpenAI-compatible LLM API**, such as **LM Studio**, **vLLM**, or other self-hosted services.
 
-This wrapper focuses on simplifying advanced tasks and local development.
+This wrapper simplifies advanced workflows (streaming, multimodal input, function calling, reasoning extraction, etc.) for both **local** and **remote** development.
 
-### ✨ Key Features
+---
 
-* **OpenAI API Compatibility:** Uses the standard `openai.OpenAI` client with configurable `base_url` and `api_key` in the constructor.
-* **Streaming Output:** Implements a streaming generator to process responses in chunks, separating them into **"answer"**, **"reasoning"**, and **"tool_call"** types.
-* **Tool/Function Calling:** Accumulates and reconstructs fragmented tool call information from the stream, including the function name and JSON arguments.
-* **Multimodal Support (`vllm_mode`):** When enabled, it converts local image sources (paths via `"image_path"` or PIL objects via `"image_pil"`) into **Base64-encoded data URLs**, compatible with multimodal LLMs that follow the OpenAI Vision format.
-* **Reasoning/CoT Extraction:** Separates internal thinking from the main response by detecting and processing content between custom **`<think>`** and **`</think>`** tags.
-* **LM Studio Unloading (Optional):** Includes specific logic (`lm_studio_unload=True`) using the `lmstudio` package to automatically check and unload other loaded models to prepare for the configured model.
+## ✨ Features
 
-### ⬇️ Dependencies
+- **🔗 OpenAI API Compatibility:** Works with any API exposing the OpenAI schema (`/v1/chat/completions`).
+- **⚡ Streaming Support:** Yields structured chunks (`answer`, `reasoning`, `tool_call`, `final`).
+- **🧠 Reasoning Extraction:** Detects and separates model reasoning enclosed in `<think>`…`</think>` tags.
+- **🧰 Function / Tool Calls:** Aggregates fragmented tool calls into a structured Python list.
+- **🖼️ Multimodal Input (`vllm_mode`):** Converts local or in-memory images into Base64 `data:image/png;base64,...` URLs.
+- **🧹 LM Studio Model Management:** Optionally unloads other loaded models before inference (`lm_studio_unload_model=True`).
 
-This project requires the `openai` SDK and `Pillow` for image handling:
+---
+
+## 📦 Installation
 
 ```bash
 pip install openai pillow
-```
-If you plan to use the lm_studio_unload_model=True feature, you'll also need:
-```bash
+# optional
 pip install lmstudio
 ```
 
-### 🧑‍💻 Usage Example
+---
 
-#### 1. Initialize the Wrapper
+## 🧑‍💻 Usage
+
+### 1️⃣ Initialize the Wrapper
 ```python
 from llm_wrapper import LLM
 
 llm = LLM(
     model="openai/gpt-oss-20b",
-    base_url="your base url", #(defaults to LM Studio settings)
-    api_key="your api key", #(defaults to LM Studio settings)
+    base_url="http://localhost:1234/v1",
+    api_key="lm-studio"
 )
 ```
 
-#### 2. Get response
-```
+### 2️⃣ Basic Chat
+```python
 messages = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "Solve the problem 2+2*3"}
-        ]
-    }
+    {"role": "user", "content": [{"type": "text", "text": "Solve 2+2*3"}]}
 ]
 response = llm.response(messages=messages)
 print(response)
 ```
 
-#### Response Format
-```
-response = {
-    "reasoning":"model reasoning as str",
-    "answer":"model answer as str",
-    "tool calss":"model tool call(s) as list",
-    }
-```
-
-#### 3. Image Input
-```
-llm = LLM(
-    model="qwen3-vl-4b-thinking", 
-    vllm_mode=True,
-)
-
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "Solve the problem in the picture"}
-            {"type": "image", "image_path":"your local image path"}
-            # {"type": "image", "image_url":"your image url"}
-            # {"type": "image", "image_pil":"your PIL Image object"}
-        ]
-    }
-]
-
-response = llm.response(messages=messages)
-print(response)
-```
-
-#### 4. Streaming
-```
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "Solve the problem 2+2*3"}
-        ]
-    }
-]
-response = llm.response(
-    messages=messages,
-    stream=True,
-    # final=True # includes a final chunk with answer, reasoning and tool calls in one piece
-)
-for chunk in response:
-    print(chunk["content"], end = "",flush=True)
-```
-#### Chunk Format
-```
-chunk = {"type":"reasoning,"content":"model reasoning"}
-chunk = {"type":"anwer,"content":"model answer"}
-chunk = {"type":"tool_call,"content":"model toolcall"}
-chunk = {"type":"final,"content": {
-    "reasoning":"model reasoning as str",
-    "answer":"model answer as str",
-    "tool calss":"model tool call(s) as list",
-    }
+**Output:**
+```python
+{
+    "reasoning": "...model reasoning...",
+    "answer": "8",
+    "tool_calls": []
 }
 ```
 
-#### 5. LM Studio Model Unload
-```
-response = llm.response(
-    messages=messages,
-    lm_studio_model_unload = True, # unloads other loaded models to save memory
-)
-print(response)
+---
+
+### 3️⃣ Streaming Responses
+```python
+for chunk in llm.response(messages=messages, stream=True, final=True):
+    print(chunk)
 ```
 
-#### 6. Using TOOLS
+**Chunk examples:**
+```python
+{"type": "reasoning", "content": "Thinking..."}
+{"type": "answer", "content": "8"}
+{"type": "tool_call", "content": {...}}
+{"type": "final", "content": {...}}
 ```
-tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "example_tool",
-                    "description": "example description",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "a": {"type": "number"},
-                            "b": {"type": "number"},
-                        },
-                        "required": ["a", "b"]
-                    },
-                }
-            }
+
+---
+
+### 4️⃣ Multimodal Example (Image Input)
+```python
+llm = LLM(model="qwen3-vl-4b-thinking", vllm_mode=True)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What’s in this picture?"},
+            {"type": "image", "image_path": "example.png"}
         ]
+    }
+]
 
-response = llm.response(
-    messages=messages,
-    tools=tools
-)
+response = llm.response(messages=messages)
 print(response)
 ```
 
-### 📄 License
-This project is licensed under the **MIT License**. See the `LICENSE` file for details.
+---
+
+### 5️⃣ Using Tools / Functions
+```python
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "add",
+            "description": "Add two numbers",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "number"},
+                    "b": {"type": "number"}
+                },
+                "required": ["a", "b"]
+            }
+        }
+    }
+]
+
+response = llm.response(messages=messages, tools=tools)
+print(response)
+```
+
+---
+
+## ⚙️ Parameters Overview
+
+| Parameter | Type | Default | Description |
+|------------|------|----------|-------------|
+| `model` | `str` | — | The model name (e.g. `"gpt-4"`, `"local-llm"`) |
+| `base_url` | `str` | `"http://localhost:1234/v1"` | OpenAI-compatible endpoint |
+| `api_key` | `str` | `"lm-studio"` | API key (if required) |
+| `vllm_mode` | `bool` | `False` | Enable local image handling for multimodal inputs |
+| `lm_studio_unload_model` | `bool` | `True` | Automatically unload other models in LM Studio |
+| `stream` | `bool` | `False` | Return generator chunks instead of a full dict |
+| `final` | `bool` | `False` | Add a final summary chunk at end of stream |
+
+---
+
+## 📄 License
+
+Licensed under the [MIT License](./LICENSE).
+
