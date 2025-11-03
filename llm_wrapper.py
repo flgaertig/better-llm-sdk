@@ -10,7 +10,7 @@ class LLM:
         self.model = model
         self.vllm_mode = vllm_mode
 
-    def response(self,messages:list=None,stream:bool=False,final:bool=False,tools:list=None,lm_studio_unload:bool=True):
+    def response(self,messages:list=None,stream:bool=False,final:bool=False,tools:list=None,lm_studio_unload_model:bool=True):
 
         if self.vllm_mode:
             for msg in messages:
@@ -41,7 +41,7 @@ class LLM:
                                 url_data = {"url": url_data}
                             msg["content"][i] = {"type": "image_url", "image_url": url_data}
         
-        if lm_studio_unload:
+        if lm_studio_unload_model:
             import lmstudio as lms
             lms.configure_default_client("localhost:1234")
             all_loaded_models = lms.list_loaded_models()
@@ -131,3 +131,4 @@ class LLM:
                 "reasoning": thinking,
                 "tool_calls": final_tool_calls
             }
+
