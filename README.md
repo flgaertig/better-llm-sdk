@@ -20,9 +20,9 @@ This wrapper simplifies advanced workflows (streaming, multimodal input, functio
 ## 📦 Installation
 
 ```bash
-pip install openai pillow
+pip install openai
 # optional
-pip install lmstudio
+pip install lmstudio pillow
 ```
 
 ---
