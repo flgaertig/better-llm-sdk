@@ -2,6 +2,7 @@ import json
 import base64
 from openai import OpenAI
 import io
+from typing import Any
 from PIL import Image
 
 class LLM:
@@ -12,7 +13,7 @@ class LLM:
         self.model = model
         self.vllm_mode = vllm_mode
 
-    def response(self,messages:list=None,stream:bool=False,final:bool=False,tools:list=None,lm_studio_unload_model:bool=True):
+    def response(self,messages:list[dict[str, Any]]=None,stream:bool=False,final:bool=False,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False):
         """request model inference"""
         if self.vllm_mode:
             for msg in messages:
@@ -52,12 +53,15 @@ class LLM:
                     model = lms.llm(loaded_model)
                     model.unload()
 
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=True,
-            tools=tools if tools is not None else [],
-        )
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                tools=tools if tools is not None else [],
+            )
+        except Exception as e:
+            raise RuntimeError(f"Model request failed: {e}")
 
         thinking = ""
         answer = ""
@@ -134,8 +138,3 @@ class LLM:
                 "answer": answer,
                 "tool_calls": final_tool_calls
             }
-
-
-
-
-
