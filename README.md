@@ -158,9 +158,10 @@ print(response)
 | `model` | `str` | — | The model name (e.g. `"gpt-4"`, `"local-llm"`) |
 | `base_url` | `str` | `"http://localhost:1234/v1"` | OpenAI-compatible endpoint |
 | `api_key` | `str` | `"lm-studio"` | API key (if required) |
-| `vllm_mode` | `bool` | `False` | Enable local image handling for multimodal inputs |
-| `lm_studio_unload_model` | `bool` | `False` | Automatically unload other models in LM Studio |
-| `final` | `bool` | `False` | Add a final summary chunk at end of stream |
+| `vllm_mode` | `bool` | `False` | Enables local image handling for multimodal inputs |
+| `lm_studio_unload_model` | `bool` | `False` | Automatically unloads other models in LM Studio |
+| `final` | `bool` | `False` | Adds a final summary chunk at end of stream |
+| `hide_thinking` | `bool` | `True` | includes model´s chain of thought |
 
 ---
 
