@@ -10,7 +10,7 @@ This wrapper simplifies advanced workflows (streaming, multimodal input, functio
 
 - **🔗 OpenAI API Compatibility:** Works with any API exposing the OpenAI schema (`/v1/chat/completions`).
 - **⚡ Streaming Support:** Yields structured chunks (`answer`, `reasoning`, `tool_call`, `final`).
-- **🧠 Reasoning Extraction**: Separates text inside <think>…</think> tags and returns it as a structured "reasoning" field.
+- **🧠 Reasoning Extraction**: Separates text inside `<think> … </think>` tags and returns it as a structured "reasoning" field.
 - **🧰 Function / Tool Calls:** Aggregates fragmented tool calls into a structured Python list.
 - **🖼️ Multimodal Input (`vllm_mode`):** Converts local or in-memory images into Base64 `data:image/png;base64,...` URLs.
 - **🧹 LM Studio Model Management:** Optionally unloads other loaded models before inference (`lm_studio_unload_model=True`).
