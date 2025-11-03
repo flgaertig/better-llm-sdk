@@ -54,14 +54,18 @@ print(response)
 
 #### Response Format
 ```
-chunk = {"type":"reasoning/answer/tool_call","content":"your content"}
+response = {
+    "reasoning":"model reasoning as str",
+    "answer":"model answer as str",
+    "tool calss":"model tool call(s) as list",
+    }
 ```
 
 #### 3. Image Input
 ```
 llm = LLM(
     model="qwen3-vl-4b-thinking", 
-    vllm_mode=True, # Enable local image handling (e.g., image_path)
+    vllm_mode=True,
 )
 
 messages = [
@@ -100,14 +104,22 @@ for chunk in response:
 ```
 #### Chunk Format
 ```
-chunk = {"type":"reasoning/answer/tool_call","content":"your content"}
+chunk = {"type":"reasoning,"content":"model reasoning"}
+chunk = {"type":"anwer,"content":"model answer"}
+chunk = {"type":"tool_call,"content":"model toolcall"}
+chunk = {"type":"final,"content": {
+    "reasoning":"model reasoning as str",
+    "answer":"model answer as str",
+    "tool calss":"model tool call(s) as list",
+    }
+}
 ```
 
 #### 5. LM Studio Model Unload
 ```
 response = llm.response(
     messages=messages,
-    lm_studio_model_unload = True, # unloads other models to save memory
+    lm_studio_model_unload = True, # unloads other loaded models to save memory
 )
 print(response)
 ```
@@ -118,8 +130,8 @@ tools = [
             {
                 "type": "function",
                 "function": {
-                    "name": "get_sum",
-                    "description": "Get sum of two numbers",
+                    "name": "example_tool",
+                    "description": "example description",
                     "parameters": {
                         "type": "object",
                         "properties": {
