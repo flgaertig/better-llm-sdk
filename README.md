@@ -1,6 +1,6 @@
 # 🚀 Universal LLM API Wrapper
 
-A versatile Python wrapper built on the official `openai` SDK — designed to interface with **any OpenAI-compatible LLM API**, such as **LM Studio**, **Ollama**, or other self-hosted services.
+A versatile Python wrapper built on top of the official `openai` SDK — designed to interface with **any OpenAI-compatible** LLM API, such as **LM Studio**, **Ollama**, or other self-hosted services.
 
 This wrapper simplifies advanced workflows (streaming, multimodal input, function calling, reasoning extraction, etc.) for both **local** and **remote** development.
 
@@ -21,7 +21,7 @@ This wrapper simplifies advanced workflows (streaming, multimodal input, functio
 
 ```bash
 pip install openai
-# optional
+# Optional dependencies:
 pip install lmstudio pillow
 ```
 
@@ -64,17 +64,19 @@ print(response["answer"])
 ```python
 for chunk in llm.stream_response(
     messages=messages,
-    final=True # includes a "type":"final" chunk with reasoning, answer, tool_calls 
+    final=True # adds a final structured summary chunk at the end of the stream
 ):
     print(chunk["content"])
 ```
 
 **Chunk examples:**
 ```python
-{"type": "reasoning", "content": "CoT if reasoning model"}
+{"type": "reasoning", "content": "Chain of Thought (if reasoning model)"}
 {"type": "answer", "content": "8"}
 {"type": "tool_call", "content": {...}}
+{"type": "tool_result", "content": {"name": "tool name", "result": "..."}}
 {"type": "final", "content": {...}}
+{"type":"done", "content": None}
 ```
 
 ---
@@ -87,7 +89,7 @@ messages = [
     {
         "role": "user",
         "content": [
-            {"type": "text", "text": "What’s in this picture?"},
+            {"type": "text", "text": "What's in this picture?"},
             {"type": "image", "image_path": "example.png"},
             #{"type": "image", "image_url": "example.com/image.png"}
             #{"type": "image", "image_pil": PIL Image object}
@@ -96,33 +98,42 @@ messages = [
 ]
 
 response = llm.response(messages=messages)
-print(response)
+print(response["answer"])
 ```
 
 ---
 
 ### 5️⃣ Using Tools / Functions
 ```python
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "add",
-            "description": "Add two numbers",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "a": {"type": "number"},
-                    "b": {"type": "number"}
-                },
-                "required": ["a", "b"]
-            }
+
+def get_weather(location: str): # converts callable tools in OpenAI-style tool definitions, runs them automatically and returns the result in the response
+    """Weather tool, gives weather at location
+
+    param location: string
+    return: string with weather information
+    """
+    return "sunny, 25 degrees Celsius"
+
+sum_tool = { # gives back a tool call
+    "type": "function",
+    "function": {
+        "name": "add",
+        "description": "Add two numbers",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "a": {"type": "number"},
+                "b": {"type": "number"}
+            },
+            "required": ["a", "b"]
         }
     }
-]
+}
+
+tools=[sum_tool, get_weather]
 
 response = llm.response(messages=messages, tools=tools)
-print(response)
+print(response["answer"])
 ```
 ---
 
@@ -146,8 +157,9 @@ output_format = {
 }
 
 response = llm.response(messages=messages, output_format=output_format)
-print(response)
+print(response["answer"]) # JSON object if successful
 ```
+Requires an API endpoint that supports the `response_format` parameter (e.g. OpenAI `gpt-4o` or LM Studio with JSON schema support). ⚠️
 
 ---
 
@@ -155,13 +167,12 @@ print(response)
 
 | Parameter | Type | Default | Description |
 |------------|------|----------|-------------|
-| `model` | `str` | — | The model name (e.g. `"gpt-4"`, `"local-llm"`) |
+| `model` | `str` | — | The model name (e.g. `"gpt-4"`, `"qwen3-8b"`) |
 | `base_url` | `str` | `"http://localhost:1234/v1"` | OpenAI-compatible endpoint |
 | `api_key` | `str` | `"lm-studio"` | API key (if required) |
 | `vllm_mode` | `bool` | `False` | Enables local image handling for multimodal inputs |
 | `lm_studio_unload_model` | `bool` | `False` | Automatically unloads other models in LM Studio |
-| `final` | `bool` | `False` | Adds a final summary chunk at end of stream |
-| `hide_thinking` | `bool` | `True` | includes model´s chain of thought |
+| `hide_thinking` | `bool` | `True` | If `True`, reasoning (inside `<think>` tags) is hidden from output chunks |
 
 ---
 

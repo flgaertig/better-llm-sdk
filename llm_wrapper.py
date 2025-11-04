@@ -11,6 +11,8 @@ class LLM:
         """initialize the wrapper"""
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
         self.vllm_mode = vllm_mode
 
     def response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,tools:list=None,lm_studio_unload_model:bool=False,hide_thinking:bool=True):
@@ -110,7 +112,7 @@ class LLM:
         
         if lm_studio_unload_model:
             import lmstudio as lms
-            lms.configure_default_client("localhost:1234")
+            lms.configure_default_client(self.base_url)
             all_loaded_models = lms.list_loaded_models()
             for loaded_model in all_loaded_models:
                 if loaded_model.identifier != self.model:
@@ -267,13 +269,13 @@ class LLM:
     def lm_studio_count_tokens(self,input_text: str) -> int:
         """count tokens used in lm studio"""
         import lmstudio as lms
-        lms.configure_default_client("localhost:1234")
+        lms.configure_default_client(self.base_url)
         model = lms.llm(self.model)
         token_count = len(model.tokenize(input_text))
         return token_count
     
     def lm_studio_get_context_length(self) -> int:
         import lmstudio as lms
-        lms.configure_default_client("localhost:1234")
+        lms.configure_default_client(self.base_url)
         model = lms.llm(self.model)
         return model.get_context_length()
