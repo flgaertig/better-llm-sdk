@@ -176,15 +176,34 @@ class LLM:
             yield {"type": "tool_call", "content": tool_call}
 
         if final:
-            if not hide_thinking:
+            if hide_thinking or thinking == "":
+                if final_tool_calls == []:
+                    yield {"type": "final", "content": {
+                        "answer": answer,
+                        }    
+                    }
+                else:
+                    yield {"type": "final", "content": {
+                        "answer": answer,
+                        "tool_calls": final_tool_calls
+                        }    
+                    }
+            else:
+                if final_tool_calls == []:
+                    yield {"type": "final", "content": {
+                        "reasoning": thinking,
+                        "answer": answer,
+                        }    
+                    }
+                else:
+                    yield {"type": "final", "content": {
+                        "reasoning": thinking,
+                        "answer": answer,
+                        "tool_calls": final_tool_calls
+                        }    
+                    }                    
                 yield {"type": "final", "content": {
                     "reasoning": thinking,
-                    "answer": answer,
-                    "tool_calls": final_tool_calls
-                    }    
-                }
-            else:
-                yield {"type": "final", "content": {
                     "answer": answer,
                     "tool_calls": final_tool_calls
                     }    
@@ -204,3 +223,4 @@ class LLM:
         lms.configure_default_client("localhost:1234")
         model = lms.llm(self.model)
         return model.get_context_length()
+
