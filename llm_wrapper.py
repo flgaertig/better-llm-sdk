@@ -222,7 +222,6 @@ class LLM:
                     yield {
                         "type": "tool_result", 
                         "content": {
-                            "tool_call_id": tool_call["id"],
                             "name": tool_name,
                             "result": result
                         }
