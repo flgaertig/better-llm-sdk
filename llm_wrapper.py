@@ -72,9 +72,8 @@ class LLM:
             lms.configure_default_client("localhost:1234")
             all_loaded_models = lms.list_loaded_models()
             for loaded_model in all_loaded_models:
-                if loaded_model != self.model:
-                    model = lms.llm(loaded_model)
-                    model.unload()
+                if loaded_model.identifier != self.model:
+                    loaded_model.unload()
 
         structured_output = output_format is not None
 
@@ -223,4 +222,5 @@ class LLM:
         lms.configure_default_client("localhost:1234")
         model = lms.llm(self.model)
         return model.get_context_length()
+
 
