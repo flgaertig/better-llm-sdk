@@ -2,8 +2,8 @@ import json
 import base64
 from openai import OpenAI
 import io
-from typing import Any
 from PIL import Image
+from typing import Callable, Any
 
 class LLM:
     """Universal LLM API Wrapper compatible with OpenAI-style APIs."""
@@ -13,7 +13,7 @@ class LLM:
         self.model = model
         self.vllm_mode = vllm_mode
 
-    def response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False,hide_thinking:bool=True):
+    def response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,tools:list=None,lm_studio_unload_model:bool=False,hide_thinking:bool=True):
         """request model inference"""
 
         if messages is None:
@@ -32,8 +32,49 @@ class LLM:
             if r["type"] == "final":
                 return r["content"]
                 
-    def stream_response(self,messages:list[dict[str, Any]]=None,output_format:dict=None,final:bool=False,tools:list[dict[str, Any]]=None,lm_studio_unload_model:bool=False,hide_thinking:bool=True):
+    def stream_response(self,messages:list[dict]=None,output_format:dict=None,final:bool=False,tools:list=None,lm_studio_unload_model:bool=False,hide_thinking:bool=True):
         """request model inference"""
+        _tools = list(tools) if tools else []
+        callable_tools = {}
+        if _tools:
+            types = {
+                        "str":"string",
+                        "int":"integer",
+                        "float":"number",
+                        "bool":"boolean",
+                        "list":"array",
+                        "dict":"object"
+                    }
+            for i in range(len(_tools)):
+                if isinstance(_tools[i],Callable):
+                    name = _tools[i].__name__.strip()
+                    doc = _tools[i].__doc__.strip()
+                    param = _tools[i].__annotations__
+                    required_params = []
+                    parameters = {}
+                    for k,v in param.items():
+                        if k == "return":
+                            continue
+                        else:
+                            parameters[str(k)] = {"type": types[v.__name__]}
+                            required_params.append(str(k))
+                    _tools[i] = {
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": doc,
+                            "parameters": {
+                                "type": "object",
+                                "properties": parameters,
+                                "required": required_params
+                            }
+                        }
+                    }
+                    callable_tools[name] = tools[i]
+                elif isinstance(_tools[i],dict):
+                    continue
+                else:
+                    raise ValueError("tools must be a list of callables or dicts")
 
         if messages is None:
             raise ValueError("messages must be provided")
@@ -142,13 +183,13 @@ class LLM:
             if tool_calls:
                 for tool_call in tool_calls:
                     tool_id = tool_call.id or "0"
-                    func = tool_call.function
+                    funct = tool_call.function
                     if tool_id not in tool_calls_accumulator:
-                        tool_calls_accumulator[tool_id] = {"name": func.name or "", "arguments": ""}
-                    if func.name:
-                        tool_calls_accumulator[tool_id]["name"] = func.name
-                    if func.arguments:
-                        tool_calls_accumulator[tool_id]["arguments"] += func.arguments
+                        tool_calls_accumulator[tool_id] = {"name": funct.name or "", "arguments": ""}
+                    if funct.name:
+                        tool_calls_accumulator[tool_id]["name"] = funct.name
+                    if funct.arguments:
+                        tool_calls_accumulator[tool_id]["arguments"] += funct.arguments
 
         if structured_output:
             temp_answer = answer
@@ -170,12 +211,33 @@ class LLM:
             except json.JSONDecodeError:
                 args = {"_raw": data["arguments"] or ""}
             final_tool_calls.append({"id": tool_id, "name": data["name"], "arguments": args})
-
-        for tool_call in final_tool_calls:
-            yield {"type": "tool_call", "content": tool_call}
+        
+        for tool_call in final_tool_calls[:]: 
+            tool_name = tool_call["name"]
+            
+            if tool_name in callable_tools:
+                try:
+                    func_to_call = callable_tools[tool_name]
+                    result = func_to_call(**tool_call["arguments"])
+                    yield {
+                        "type": "tool_result", 
+                        "content": {
+                            "tool_call_id": tool_call["id"],
+                            "name": tool_name,
+                            "result": result
+                        }
+                    }
+                    final_tool_calls.remove(tool_call)
+                    
+                except Exception as e:
+                    print(f"Error executing tool {tool_name}: {e}")
+                    final_tool_calls.remove(tool_call)
+                    
+            else:
+                yield {"type": "tool_call", "content": tool_call}
 
         if final:
-            if hide_thinking or thinking == "":
+            if hide_thinking or thinking.strip() == "":
                 if final_tool_calls == []:
                     yield {"type": "final", "content": {
                         "answer": answer,
@@ -200,13 +262,7 @@ class LLM:
                         "answer": answer,
                         "tool_calls": final_tool_calls
                         }    
-                    }                    
-                yield {"type": "final", "content": {
-                    "reasoning": thinking,
-                    "answer": answer,
-                    "tool_calls": final_tool_calls
-                    }    
-                }
+                    }
         yield {"type": "done", "content": None}
     
     def lm_studio_count_tokens(self,input_text: str) -> int:
@@ -222,5 +278,3 @@ class LLM:
         lms.configure_default_client("localhost:1234")
         model = lms.llm(self.model)
         return model.get_context_length()
-
-
