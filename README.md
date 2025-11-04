@@ -20,10 +20,12 @@ This wrapper simplifies advanced workflows (streaming, multimodal input, functio
 ## 📦 Installation
 
 ```bash
+# Requires: Python ≥ 3.10 and openai SDK ≥ 1.12.0
 pip install openai
 # Optional dependencies:
 pip install lmstudio pillow
 ```
+
 
 ---
 
@@ -106,7 +108,7 @@ print(response["answer"])
 ### 5️⃣ Using Tools / Functions
 ```python
 
-def get_weather(location: str): # converts callable tools in OpenAI-style tool definitions, runs them automatically and returns the result in the response
+def get_weather(location: str): # converts callable tools to OpenAI-style tool definitions, runs them automatically and returns the result in the response
     """Weather tool, gives weather at location
 
     param location: string
