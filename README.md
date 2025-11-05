@@ -1,4 +1,4 @@
-# 🚀 Universal LLM API Wrapper
+# better-sdk 🚀: Universal LLM API Wrapper
 
 A versatile Python wrapper built on top of the official `openai` SDK — designed to interface with **any OpenAI-compatible** LLM API, such as **LM Studio**, **Ollama**, or other self-hosted services.
 
