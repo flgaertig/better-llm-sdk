@@ -2,7 +2,6 @@ import json
 import base64
 from openai import OpenAI
 import io
-from PIL import Image
 from typing import Callable, Any
 
 class LLM:
@@ -82,6 +81,7 @@ class LLM:
             raise ValueError("messages must be provided")
 
         if self.vllm_mode:
+            from PIL import Image
             for msg in messages:
                 for i in range(len(msg["content"])):
                     c = msg["content"][i]
