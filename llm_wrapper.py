@@ -224,6 +224,7 @@ class LLM:
                 args = {"_raw": data["arguments"] or ""}
             final_tool_calls.append({"id": tool_id, "name": data["name"], "arguments": args})
 
+        executed_tool_results = []
         for tool_call in final_tool_calls[:]:
             tool_name = tool_call["name"]
 
@@ -231,12 +232,16 @@ class LLM:
                 try:
                     func_to_call = callable_tools[tool_name]
                     result = func_to_call(**tool_call["arguments"])
+                    
+                    tool_result_content = {
+                        "name": tool_name,
+                        "result": result
+                    }
+                    executed_tool_results.append(tool_result_content)
+
                     yield {
                         "type": "tool_result",
-                        "content": {
-                            "name": tool_name,
-                            "result": result
-                        }
+                        "content": tool_result_content
                     }
                     final_tool_calls.remove(tool_call)
 
@@ -248,32 +253,15 @@ class LLM:
                 yield {"type": "tool_call", "content": tool_call}
 
         if final:
-            if hide_thinking or thinking.strip() == "":
-                if final_tool_calls == []:
-                    yield {"type": "final", "content": {
-                        "answer": answer.strip(),
-                    }
-                    }
-                else:
-                    yield {"type": "final", "content": {
-                        "answer": answer.strip(),
-                        "tool_calls": final_tool_calls
-                    }
-                    }
-            else:
-                if final_tool_calls == []:
-                    yield {"type": "final", "content": {
-                        "reasoning": thinking.strip(),
-                        "answer": answer.strip(),
-                    }
-                    }
-                else:
-                    yield {"type": "final", "content": {
-                        "reasoning": thinking.strip(),
-                        "answer": answer.strip(),
-                        "tool_calls": final_tool_calls
-                    }
-                    }
+            content = {"answer": answer.strip()}
+            if not hide_thinking and thinking.strip():
+                content["reasoning"] = thinking.strip()
+            if final_tool_calls:
+                content["tool_calls"] = final_tool_calls
+            if executed_tool_results:
+                content["tool_results"] = executed_tool_results
+                
+            yield {"type": "final", "content": content}
         yield {"type": "done", "content": None}
 
     async def async_response(self, messages: list[dict[str, Any]] = None, output_format: dict = None, tools: list = None,
@@ -483,6 +471,7 @@ class LLM:
                 args = {"_raw": data["arguments"] or ""}
             final_tool_calls.append({"id": tool_id, "name": data["name"], "arguments": args})
 
+        executed_tool_results = []
         for tool_call in final_tool_calls[:]:
             tool_name = tool_call["name"]
 
@@ -494,12 +483,15 @@ class LLM:
                     else:
                         result = func_to_call(**tool_call["arguments"])
 
+                    tool_result_content = {
+                        "name": tool_name,
+                        "result": result
+                    }
+                    executed_tool_results.append(tool_result_content)
+
                     yield {
                         "type": "tool_result",
-                        "content": {
-                            "name": tool_name,
-                            "result": result
-                        }
+                        "content": tool_result_content
                     }
                     final_tool_calls.remove(tool_call)
 
@@ -511,32 +503,15 @@ class LLM:
                 yield {"type": "tool_call", "content": tool_call}
 
         if final:
-            if hide_thinking or thinking.strip() == "":
-                if final_tool_calls == []:
-                    yield {"type": "final", "content": {
-                        "answer": answer.strip(),
-                    }
-                    }
-                else:
-                    yield {"type": "final", "content": {
-                        "answer": answer.strip(),
-                        "tool_calls": final_tool_calls
-                    }
-                    }
-            else:
-                if final_tool_calls == []:
-                    yield {"type": "final", "content": {
-                        "reasoning": thinking.strip(),
-                        "answer": answer.strip(),
-                    }
-                    }
-                else:
-                    yield {"type": "final", "content": {
-                        "reasoning": thinking.strip(),
-                        "answer": answer.strip(),
-                        "tool_calls": final_tool_calls
-                    }
-                    }
+            content = {"answer": answer.strip()}
+            if not hide_thinking and thinking.strip():
+                content["reasoning"] = thinking.strip()
+            if final_tool_calls:
+                content["tool_calls"] = final_tool_calls
+            if executed_tool_results:
+                content["tool_results"] = executed_tool_results
+            
+            yield {"type": "final", "content": content}
         yield {"type": "done", "content": None}
 
     def lm_studio_count_tokens(self, input_text: str) -> int:
