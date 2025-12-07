@@ -172,9 +172,15 @@ class LLM:
                 if "<think>" in str(content):
                     inside_think = True
                     content = str(content).replace("<think>", "")
+                if "[THINK]" in str(content):
+                    inside_think = True
+                    content = str(content).replace("[THINK]", "")
                 if "</think>" in str(content):
                     inside_think = False
                     content = str(content).replace("</think>", "")
+                if "[/THINK]" in str(content):
+                    inside_think = False
+                    content = str(content).replace("[/THINK]", "")
                 if inside_think:
                     thinking += str(content)
                     if not hide_thinking:
@@ -419,9 +425,15 @@ class LLM:
                 if "<think>" in str(content):
                     inside_think = True
                     content = str(content).replace("<think>", "")
+                if "[THINK]" in str(content):
+                    inside_think = True
+                    content = str(content).replace("[THINK]", "")
                 if "</think>" in str(content):
                     inside_think = False
                     content = str(content).replace("</think>", "")
+                if "[/THINK]" in str(content):
+                    inside_think = False
+                    content = str(content).replace("[/THINK]", "")
                 if inside_think:
                     thinking += str(content)
                     if not hide_thinking:
