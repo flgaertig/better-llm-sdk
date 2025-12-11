@@ -25,14 +25,13 @@ A universal, production-ready Python wrapper for OpenAI-compatible LLM APIs with
 ### Prerequisites
 
 ```bash
-pip install openai pillow
+pip install openai
 ```
 
 ### Optional Dependencies
 
-For LM Studio integration:
 ```bash
-pip install lmstudio
+pip install lmstudio pillow
 ```
 
 ### Install from Source
