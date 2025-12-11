@@ -1,16 +1,39 @@
 import json
 import base64
+import re
+import uuid
 from openai import OpenAI, AsyncOpenAI
 import io
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Dict, Optional, List, Callable
 import inspect
 import asyncio
 
+
 class LLM:
     """Universal api wrapper for LLM models with openai compatible api (e.g., LM Studio)"""
+
+    # Type mapping for JSON Schema
+    TYPE_MAPPING = {
+        "str": "string",
+        "int": "integer",
+        "float": "number",
+        "bool": "boolean",
+        "list": "array",
+        "dict": "object",
+        "nonetype": "null",
+    }
+
     def __init__(self, model: str, vllm_mode: bool = False, api_key: str = "lm-studio",
                  base_url: str = "http://localhost:1234/v1"):
-        """initialize the wrapper"""
+        """
+        Initialize the wrapper.
+        
+        Args:
+            model: The model identifier to use
+            vllm_mode: Whether to use vLLM-specific image processing
+            api_key: API key for authentication
+            base_url: Base URL for the API endpoint
+        """
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.async_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.model = model
@@ -18,10 +41,221 @@ class LLM:
         self.api_key = api_key
         self.vllm_mode = vllm_mode
 
-    def response(self, messages: list[dict[str, Any]] = None, output_format: dict = None, tools: list = None,
-                 lm_studio_unload_model: bool = False, hide_thinking: bool = True):
-        """request model inference"""
+    def _get_json_type(self, python_type) -> str:
+        """
+        Convert Python type annotation to JSON Schema type.
+        
+        Args:
+            python_type: A Python type annotation
+            
+        Returns:
+            JSON Schema type string
+        """
+        type_name = getattr(python_type, "__name__", None)
+        if type_name is None:
+            type_str = str(python_type)
+            # Handle Optional, Union types
+            if "Optional" in type_str or "Union" in type_str:
+                # Extract the first inner type
+                inner = type_str.split("[", 1)[1].rsplit("]", 1)[0].split(",")[0].strip()
+                type_name = inner.replace("typing.", "").lower()
+            else:
+                type_name = type_str.split("[", 1)[0].replace("typing.", "").lower()
+        
+        return self.TYPE_MAPPING.get(type_name.lower() if type_name else "str", "string")
 
+    def _prepare_tools(self, tools: Optional[List]) -> tuple[List[Dict], Dict[str, Callable]]:
+        """
+        Convert callable functions to OpenAI tool format.
+        
+        Args:
+            tools: List of callables or tool definition dicts
+            
+        Returns:
+            Tuple of (prepared_tools, callable_tools_dict)
+        """
+        if not tools:
+            return [], {}
+        
+        _tools = list(tools)
+        callable_tools = {}
+        
+        for i in range(len(_tools)):
+            if callable(_tools[i]):
+                func = _tools[i]
+                name = func.__name__.strip()
+                callable_tools[name] = func
+                doc = (func.__doc__ or "").strip()
+                
+                # Get parameter annotations and signature
+                param_annotations = func.__annotations__
+                sig = inspect.signature(func)
+                
+                required_params = []
+                parameters = {}
+                
+                for param_name, param_obj in sig.parameters.items():
+                    if param_name == "return":
+                        continue
+                    
+                    # Get type from annotations if available
+                    if param_name in param_annotations:
+                        json_type = self._get_json_type(param_annotations[param_name])
+                    else:
+                        json_type = "string"
+                    
+                    parameters[param_name] = {"type": json_type}
+                    
+                    # Check if parameter has no default value → required
+                    if param_obj.default == inspect.Parameter.empty:
+                        required_params.append(param_name)
+                
+                _tools[i] = {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": doc,
+                        "parameters": {
+                            "type": "object",
+                            "properties": parameters,
+                            "required": required_params
+                        }
+                    }
+                }
+            elif isinstance(_tools[i], dict):
+                continue
+            else:
+                raise ValueError("tools must be a list of callables or dicts")
+        
+        return _tools, callable_tools
+
+    def _process_images(self, messages: List[Dict]) -> None:
+        """
+        Convert custom image formats to base64 for vLLM mode.
+        Modifies messages in-place.
+        
+        Args:
+            messages: List of message dicts to process
+        """
+        from PIL import Image
+        
+        for msg in messages:
+            if "content" not in msg:
+                continue
+            if not isinstance(msg["content"], list):
+                continue
+            
+            for i in range(len(msg["content"])):
+                c = msg["content"][i]
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") != "image":
+                    continue
+                
+                if "image_path" in c:
+                    try:
+                        with Image.open(c["image_path"]) as img:
+                            buffer = io.BytesIO()
+                            img.save(buffer, format="PNG")
+                            buffer.seek(0)
+                            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        msg["content"][i] = {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        }
+                    except Exception as e:
+                        raise ValueError(f"Failed to process image from path: {e}")
+                        
+                elif "image_pil" in c:
+                    try:
+                        img = c["image_pil"]
+                        buffer = io.BytesIO()
+                        img.save(buffer, format="PNG")
+                        buffer.seek(0)
+                        img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        msg["content"][i] = {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        }
+                    except Exception as e:
+                        raise ValueError(f"Failed to process PIL image: {e}")
+                        
+                elif "image_url" in c:
+                    url_data = c["image_url"]
+                    if isinstance(url_data, str):
+                        url_data = {"url": url_data}
+                    msg["content"][i] = {"type": "image_url", "image_url": url_data}
+
+    def _parse_thinking_content(self, content: str, inside_think: bool) -> tuple[str, bool, str, str]:
+        """
+        Parse thinking tags from content (case-insensitive).
+        
+        Args:
+            content: The content string to parse
+            inside_think: Current thinking state
+            
+        Returns:
+            Tuple of (cleaned_content, new_inside_think, thinking_part, answer_part)
+        """
+        thinking_part = ""
+        answer_part = ""
+        
+        # Case-insensitive tag detection and removal
+        content_check = content.lower()
+        
+        if "<think>" in content_check or "[think]" in content_check:
+            inside_think = True
+            content = re.sub(r'<think>|\[THINK\]', '', content, flags=re.IGNORECASE)
+        
+        if "</think>" in content_check or "[/think]" in content_check:
+            # Split content at closing tag
+            parts = re.split(r'</think>|\[/THINK\]', content, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                thinking_part = parts[0]
+                answer_part = parts[1]
+                inside_think = False
+                return "", inside_think, thinking_part, answer_part
+            else:
+                inside_think = False
+                content = re.sub(r'</think>|\[/THINK\]', '', content, flags=re.IGNORECASE)
+        
+        if inside_think:
+            thinking_part = content
+        else:
+            answer_part = content
+            
+        return content, inside_think, thinking_part, answer_part
+
+    def _unload_other_models(self) -> None:
+        """Unload all models except the current one in LM Studio."""
+        import lmstudio as lms
+        lms.configure_default_client(self.base_url)
+        all_loaded_models = lms.list_loaded_models()
+        for loaded_model in (all_loaded_models or []):
+            if loaded_model.identifier != self.model:
+                loaded_model.unload()
+
+    def response(self, messages: List[Dict[str, Any]] = None, output_format: Dict = None, 
+                 tools: List = None, lm_studio_unload_model: bool = False, 
+                 hide_thinking: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Request model inference (non-streaming).
+        
+        Args:
+            messages: List of conversation messages
+            output_format: JSON schema for structured output
+            tools: List of callable functions or tool definitions
+            lm_studio_unload_model: Whether to unload other models in LM Studio
+            hide_thinking: Whether to hide reasoning tokens
+            
+        Returns:
+            Dict containing the final response with answer and optional tool_calls,
+            or None if no final response received
+            
+        Raises:
+            ValueError: If messages is None
+            RuntimeError: If no final response is received
+        """
         if messages is None:
             raise ValueError("messages must be provided")
 
@@ -34,122 +268,64 @@ class LLM:
             hide_thinking=hide_thinking,
         )
 
+        final_content = None
         for r in response:
             if r["type"] == "final":
-                return r["content"]
+                final_content = r["content"]
+                break
+        
+        if final_content is None:
+            raise RuntimeError("No final response received from model")
+        
+        return final_content
 
-    def stream_response(self, messages: list[dict] = None, output_format: dict = None, final: bool = False, tools: list = None,
-                        lm_studio_unload_model: bool = False, hide_thinking: bool = True):
-        """request model inference"""
-        _tools = list(tools) if tools else []
-        callable_tools = {}
-        if _tools:
-            types = {
-                "str": "string",
-                "int": "integer",
-                "float": "number",
-                "bool": "boolean",
-                "list": "array",
-                "dict": "object"
-            }
-            for i in range(len(_tools)):
-                if callable(_tools[i]):
-                    func=_tools[i]
-                    name = func.__name__.strip()
-                    callable_tools[name] = func
-                    doc = (func.__doc__ or "").strip()
-                    param = func.__annotations__
-                    required_params = []
-                    parameters = {}
-                    for k, v in param.items():
-                        if k == "return":
-                            continue
-                        else:
-                            type_name = getattr(v, "__name__", None)
-                            if type_name is None:
-                                type_name = str(v).split("[", 1)[0].replace("typing.", "").lower()
-                            parameters[str(k)] = {"type": types.get(type_name, "string")}
-                    _tools[i] = {
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "description": doc,
-                            "parameters": {
-                                "type": "object",
-                                "properties": parameters,
-                                "required": required_params
-                            }
-                        }
-                    }
-                elif isinstance(_tools[i], dict):
-                    continue
-                else:
-                    raise ValueError("tools must be a list of callables or dicts")
-
+    def stream_response(self, messages: List[Dict] = None, output_format: Dict = None, 
+                        final: bool = False, tools: List = None,
+                        lm_studio_unload_model: bool = False, 
+                        hide_thinking: bool = True) -> Any:
+        """
+        Request model inference with streaming.
+        
+        Args:
+            messages: List of conversation messages
+            output_format: JSON schema for structured output
+            final: Whether to yield a final aggregated response
+            tools: List of callable functions or tool definitions
+            lm_studio_unload_model: Whether to unload other models in LM Studio
+            hide_thinking: Whether to hide reasoning tokens
+            
+        Yields:
+            Dicts with type and content for each chunk/event
+        """
         if messages is None:
             raise ValueError("messages must be provided")
 
-        if self.vllm_mode:
-            from PIL import Image
-            for msg in messages:
-                for i in range(len(msg["content"])):
-                    c = msg["content"][i]
-                    if c["type"] == "image":
-                        if "image_path" in c:
-                            with Image.open(c["image_path"]) as img:
-                                buffer = io.BytesIO()
-                                img.save(buffer, format="PNG")
-                            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                            msg["content"][i] = {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                            }
-                        elif "image_pil" in c:
-                            img = c["image_pil"]
-                            buffer = io.BytesIO()
-                            img.save(buffer, format="PNG")
-                            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                            msg["content"][i] = {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                            }
-                        elif "image_url" in c:
-                            url_data = c["image_url"]
-                            if isinstance(url_data, str):
-                                url_data = {"url": url_data}
-                            msg["content"][i] = {"type": "image_url", "image_url": url_data}
+        # Prepare tools using helper method
+        _tools, callable_tools = self._prepare_tools(tools)
 
+        # Process images if in vLLM mode
+        if self.vllm_mode:
+            self._process_images(messages)
+
+        # Unload other models if requested
         if lm_studio_unload_model:
-            import lmstudio as lms
-            lms.configure_default_client(self.base_url)
-            all_loaded_models = lms.list_loaded_models()
-            for loaded_model in (all_loaded_models or []):
-                if loaded_model.identifier != self.model:
-                    loaded_model.unload()
+            self._unload_other_models()
 
         structured_output = output_format is not None
 
-        if structured_output:
-            try:
-                completion = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    stream=True,
-                    tools=tools if tools is not None else [],
-                    response_format=output_format if output_format is not None else None,
-                )
-            except Exception as e:
-                raise RuntimeError(f"Model request failed: {e}")
-        else:
-            try:
-                completion = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    stream=True,
-                    tools=tools if tools is not None else [],
-                )
-            except Exception as e:
-                raise RuntimeError(f"Model request failed: {e}")
+        try:
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "stream": True,
+                "tools": _tools if _tools else [],
+            }
+            if structured_output:
+                kwargs["response_format"] = output_format
+            
+            completion = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            raise RuntimeError(f"Model request failed: {e}")
 
         thinking = ""
         answer = ""
@@ -157,6 +333,8 @@ class LLM:
         inside_think = False
 
         for chunk in completion:
+            if not chunk.choices:
+                continue
             x = chunk.choices[0].delta
             if not x:
                 continue
@@ -169,26 +347,19 @@ class LLM:
                 continue
 
             if content:
-                if "<think>" in str(content):
-                    inside_think = True
-                    content = str(content).replace("<think>", "")
-                if "[THINK]" in str(content):
-                    inside_think = True
-                    content = str(content).replace("[THINK]", "")
-                if "</think>" in str(content):
-                    inside_think = False
-                    content = str(content).replace("</think>", "")
-                if "[/THINK]" in str(content):
-                    inside_think = False
-                    content = str(content).replace("[/THINK]", "")
-                if inside_think:
-                    thinking += str(content)
+                _, inside_think, thinking_part, answer_part = self._parse_thinking_content(
+                    str(content), inside_think
+                )
+                
+                if thinking_part:
+                    thinking += thinking_part
                     if not hide_thinking:
-                        yield {"type": "reasoning", "content": str(content)}
-                else:
-                    answer += str(content)
+                        yield {"type": "reasoning", "content": thinking_part}
+                
+                if answer_part:
+                    answer += answer_part
                     if not structured_output:
-                        yield {"type": "answer", "content": str(content)}
+                        yield {"type": "answer", "content": answer_part}
 
             if reasoning:
                 thinking += reasoning
@@ -197,7 +368,7 @@ class LLM:
 
             if tool_calls:
                 for tool_call in tool_calls:
-                    tool_id = tool_call.id or "0"
+                    tool_id = tool_call.id or str(uuid.uuid4())
                     funct = tool_call.function
                     if tool_id not in tool_calls_accumulator:
                         tool_calls_accumulator[tool_id] = {"name": funct.name or "", "arguments": ""}
@@ -222,6 +393,7 @@ class LLM:
             answer = data
             yield {"type": "answer", "content": answer}
 
+        # Build final tool calls list
         final_tool_calls = []
         for tool_id, data in tool_calls_accumulator.items():
             try:
@@ -230,15 +402,18 @@ class LLM:
                 args = {"_raw": data["arguments"] or ""}
             final_tool_calls.append({"id": tool_id, "name": data["name"], "arguments": args})
 
+        # Execute callable tools and track remaining
         executed_tool_results = []
-        for tool_call in final_tool_calls[:]:
+        remaining_tool_calls = []
+        
+        for tool_call in final_tool_calls:
             tool_name = tool_call["name"]
 
             if tool_name in callable_tools:
                 try:
                     func_to_call = callable_tools[tool_name]
                     result = func_to_call(**tool_call["arguments"])
-                    
+
                     tool_result_content = {
                         "name": tool_name,
                         "result": result
@@ -249,33 +424,53 @@ class LLM:
                         "type": "tool_result",
                         "content": tool_result_content
                     }
-                    final_tool_calls.remove(tool_call)
 
                 except Exception as e:
                     print(f"Error executing tool {tool_name}: {e}")
-                    final_tool_calls.remove(tool_call)
 
             else:
+                remaining_tool_calls.append(tool_call)
                 yield {"type": "tool_call", "content": tool_call}
 
         if final:
-            content = {"answer": answer.strip()}
+            # Type-safe answer handling
+            answer_value = answer.strip() if isinstance(answer, str) else answer
+            content = {"answer": answer_value}
             if not hide_thinking and thinking.strip():
                 content["reasoning"] = thinking.strip()
-            if final_tool_calls:
-                content["tool_calls"] = final_tool_calls
+            if remaining_tool_calls:
+                content["tool_calls"] = remaining_tool_calls
             if executed_tool_results:
                 content["tool_results"] = executed_tool_results
-                
+
             yield {"type": "final", "content": content}
         yield {"type": "done", "content": None}
 
-    async def async_response(self, messages: list[dict[str, Any]] = None, output_format: dict = None, tools: list = None,
-                             lm_studio_unload_model: bool = False, hide_thinking: bool = True):
-        """asynchron request model inference"""
+    async def async_response(self, messages: List[Dict[str, Any]] = None, output_format: Dict = None, 
+                             tools: List = None, lm_studio_unload_model: bool = False, 
+                             hide_thinking: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Asynchronous request for model inference.
+        
+        Args:
+            messages: List of conversation messages
+            output_format: JSON schema for structured output
+            tools: List of callable functions or tool definitions
+            lm_studio_unload_model: Whether to unload other models in LM Studio
+            hide_thinking: Whether to hide reasoning tokens
+            
+        Returns:
+            Dict containing the final response with answer and optional tool_calls,
+            or None if no final response received
+            
+        Raises:
+            ValueError: If messages is None
+            RuntimeError: If no final response is received
+        """
         if messages is None:
             raise ValueError("messages must be provided")
 
+        final_content = None
         async for r in self.async_stream_response(
             messages=messages,
             output_format=output_format,
@@ -285,116 +480,59 @@ class LLM:
             hide_thinking=hide_thinking
         ):
             if r["type"] == "final":
-                return r["content"]
+                final_content = r["content"]
+                break
+        
+        if final_content is None:
+            raise RuntimeError("No final response received from model")
+        
+        return final_content
 
-    async def async_stream_response(self, messages: list[dict] = None, output_format: dict = None, final: bool = False,
-                                    tools: list = None, lm_studio_unload_model: bool = False, hide_thinking: bool = True
-                                    ) -> AsyncGenerator[dict, None]:
-        """asynchron request model inference (streaming)"""
-        _tools = list(tools) if tools else []
-        callable_tools = {}
-        if _tools:
-            types = {
-                "str": "string",
-                "int": "integer",
-                "float": "number",
-                "bool": "boolean",
-                "list": "array",
-                "dict": "object"
-            }
-            for i in range(len(_tools)):
-                if callable(_tools[i]):
-                    func = _tools[i]
-                    name = func.__name__.strip()
-                    callable_tools[name] = func
-                    doc = (func.__doc__ or "").strip()
-                    param = func.__annotations__
-                    required_params = []
-                    parameters = {}
-                    for k, v in param.items():
-                        if k == "return":
-                            continue
-                        else:
-                            type_name = getattr(v, "__name__", None)
-                            if type_name is None:
-                                type_name = str(v).split("[", 1)[0].replace("typing.", "").lower()
-                            parameters[str(k)] = {"type": types.get(type_name, "string")}
-                    _tools[i] = {
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "description": doc,
-                            "parameters": {
-                                "type": "object",
-                                "properties": parameters,
-                                "required": required_params
-                            }
-                        }
-                    }
-                elif isinstance(_tools[i], dict):
-                    continue
-                else:
-                    raise ValueError("tools must be a list of callables or dicts")
-
+    async def async_stream_response(self, messages: List[Dict] = None, output_format: Dict = None, 
+                                    final: bool = False, tools: List = None, 
+                                    lm_studio_unload_model: bool = False, 
+                                    hide_thinking: bool = True) -> AsyncGenerator[Dict, None]:
+        """
+        Asynchronous request for model inference with streaming.
+        
+        Args:
+            messages: List of conversation messages
+            output_format: JSON schema for structured output
+            final: Whether to yield a final aggregated response
+            tools: List of callable functions or tool definitions
+            lm_studio_unload_model: Whether to unload other models in LM Studio
+            hide_thinking: Whether to hide reasoning tokens
+            
+        Yields:
+            Dicts with type and content for each chunk/event
+        """
         if messages is None:
             raise ValueError("messages must be provided")
 
-        if self.vllm_mode:
-            from PIL import Image
-            for msg in messages:
-                for i in range(len(msg["content"])):
-                    c = msg["content"][i]
-                    if c["type"] == "image":
-                        if "image_path" in c:
-                            with Image.open(c["image_path"]) as img:
-                                buffer = io.BytesIO()
-                                img.save(buffer, format="PNG")
-                            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                            msg["content"][i] = {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                            }
-                        elif "image_pil" in c:
-                            img = c["image_pil"]
-                            buffer = io.BytesIO()
-                            img.save(buffer, format="PNG")
-                            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                            msg["content"][i] = {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-                            }
-                        elif "image_url" in c:
-                            url_data = c["image_url"]
-                            if isinstance(url_data, str):
-                                url_data = {"url": url_data}
-                            msg["content"][i] = {"type": "image_url", "image_url": url_data}
+        # Prepare tools using helper method
+        _tools, callable_tools = self._prepare_tools(tools)
 
+        # Process images if in vLLM mode
+        if self.vllm_mode:
+            self._process_images(messages)
+
+        # Unload other models if requested
         if lm_studio_unload_model:
-            import lmstudio as lms
-            lms.configure_default_client(self.base_url)
-            all_loaded_models = lms.list_loaded_models()
-            for loaded_model in (all_loaded_models or []):
-                if loaded_model.identifier != self.model:
-                    loaded_model.unload()
+            self._unload_other_models()
 
         structured_output = output_format is not None
 
         try:
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "stream": True,
+                "tools": _tools if _tools else [],
+            }
             if structured_output:
-                create_call = self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    stream=True,
-                    tools=tools if tools is not None else [],
-                    response_format=output_format if output_format is not None else None,
-                )
-            else:
-                create_call = self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    stream=True,
-                    tools=tools if tools is not None else [],
-                )
+                kwargs["response_format"] = output_format
+
+            create_call = self.async_client.chat.completions.create(**kwargs)
 
             if asyncio.iscoroutine(create_call):
                 completion = await create_call
@@ -410,6 +548,8 @@ class LLM:
         inside_think = False
 
         async for chunk in completion:
+            if not chunk.choices:
+                continue
             x = chunk.choices[0].delta
             if not x:
                 continue
@@ -422,26 +562,19 @@ class LLM:
                 continue
 
             if content:
-                if "<think>" in str(content):
-                    inside_think = True
-                    content = str(content).replace("<think>", "")
-                if "[THINK]" in str(content):
-                    inside_think = True
-                    content = str(content).replace("[THINK]", "")
-                if "</think>" in str(content):
-                    inside_think = False
-                    content = str(content).replace("</think>", "")
-                if "[/THINK]" in str(content):
-                    inside_think = False
-                    content = str(content).replace("[/THINK]", "")
-                if inside_think:
-                    thinking += str(content)
+                _, inside_think, thinking_part, answer_part = self._parse_thinking_content(
+                    str(content), inside_think
+                )
+                
+                if thinking_part:
+                    thinking += thinking_part
                     if not hide_thinking:
-                        yield {"type": "reasoning", "content": str(content)}
-                else:
-                    answer += str(content)
+                        yield {"type": "reasoning", "content": thinking_part}
+                
+                if answer_part:
+                    answer += answer_part
                     if not structured_output:
-                        yield {"type": "answer", "content": str(content)}
+                        yield {"type": "answer", "content": answer_part}
 
             if reasoning:
                 thinking += reasoning
@@ -450,7 +583,7 @@ class LLM:
 
             if tool_calls:
                 for tool_call in tool_calls:
-                    tool_id = tool_call.id or "0"
+                    tool_id = tool_call.id or str(uuid.uuid4())
                     funct = tool_call.function
                     if tool_id not in tool_calls_accumulator:
                         tool_calls_accumulator[tool_id] = {"name": funct.name or "", "arguments": ""}
@@ -475,6 +608,7 @@ class LLM:
             answer = data
             yield {"type": "answer", "content": answer}
 
+        # Build final tool calls list
         final_tool_calls = []
         for tool_id, data in tool_calls_accumulator.items():
             try:
@@ -483,8 +617,11 @@ class LLM:
                 args = {"_raw": data["arguments"] or ""}
             final_tool_calls.append({"id": tool_id, "name": data["name"], "arguments": args})
 
+        # Execute callable tools and track remaining
         executed_tool_results = []
-        for tool_call in final_tool_calls[:]:
+        remaining_tool_calls = []
+        
+        for tool_call in final_tool_calls:
             tool_name = tool_call["name"]
 
             if tool_name in callable_tools:
@@ -505,29 +642,41 @@ class LLM:
                         "type": "tool_result",
                         "content": tool_result_content
                     }
-                    final_tool_calls.remove(tool_call)
 
                 except Exception as e:
                     print(f"Error executing async tool {tool_name}: {e}")
-                    final_tool_calls.remove(tool_call)
 
             else:
+                remaining_tool_calls.append(tool_call)
                 yield {"type": "tool_call", "content": tool_call}
 
         if final:
-            content = {"answer": answer.strip()}
+            # Type-safe answer handling
+            answer_value = answer.strip() if isinstance(answer, str) else answer
+            content = {"answer": answer_value}
             if not hide_thinking and thinking.strip():
                 content["reasoning"] = thinking.strip()
-            if final_tool_calls:
-                content["tool_calls"] = final_tool_calls
+            if remaining_tool_calls:
+                content["tool_calls"] = remaining_tool_calls
             if executed_tool_results:
                 content["tool_results"] = executed_tool_results
-            
+
             yield {"type": "final", "content": content}
         yield {"type": "done", "content": None}
 
     def lm_studio_count_tokens(self, input_text: str) -> int:
-        """count tokens used in lm studio"""
+        """
+        Count tokens used in LM Studio.
+        
+        Args:
+            input_text: The text to tokenize
+            
+        Returns:
+            Number of tokens
+            
+        Raises:
+            RuntimeError: If tokenization fails
+        """
         import lmstudio as lms
         lms.configure_default_client(self.base_url)
         try:
@@ -538,6 +687,12 @@ class LLM:
             raise RuntimeError(f"Could not count tokens for {self.model}: {e}")
 
     def lm_studio_get_context_length(self) -> int:
+        """
+        Get the context length of the model in LM Studio.
+        
+        Returns:
+            Context length in tokens
+        """
         import lmstudio as lms
         lms.configure_default_client(self.base_url)
         model = lms.llm(self.model)
