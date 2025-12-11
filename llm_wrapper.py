@@ -4,7 +4,7 @@ import re
 import uuid
 from openai import OpenAI, AsyncOpenAI
 import io
-from typing import Any, AsyncGenerator, Dict, Optional, List, Callable
+from typing import Any, AsyncGenerator, Dict, Optional, List, Callable, Union, get_type_hints, get_origin, get_args
 import inspect
 import asyncio
 
@@ -12,16 +12,7 @@ import asyncio
 class LLM:
     """Universal api wrapper for LLM models with openai compatible api (e.g., LM Studio)"""
 
-    # Type mapping for JSON Schema
-    TYPE_MAPPING = {
-        "str": "string",
-        "int": "integer",
-        "float": "number",
-        "bool": "boolean",
-        "list": "array",
-        "dict": "object",
-        "nonetype": "null",
-    }
+
 
     def __init__(self, model: str, vllm_mode: bool = False, api_key: str = "lm-studio",
                  base_url: str = "http://localhost:1234/v1"):
@@ -41,28 +32,204 @@ class LLM:
         self.api_key = api_key
         self.vllm_mode = vllm_mode
 
-    def _get_json_type(self, python_type) -> str:
+    def _python_type_to_json_schema(self, python_type, seen_models: set = None) -> Dict[str, Any]:
         """
-        Convert Python type annotation to JSON Schema type.
+        Convert Python type annotation to JSON Schema.
+        
+        Supports:
+        - Basic types: str, int, float, bool
+        - list, List[T]
+        - dict, Dict[str, T]
+        - Optional[T], Union[T, None]
+        - Literal[...] (as enum)
+        - Nested classes with __annotations__
+        """
+        if seen_models is None:
+            seen_models = set()
+
+        # Handle None type
+        if python_type is type(None):
+            return {"type": "null"}
+        
+        # Get origin for generic types (List, Dict, etc.)
+        origin = get_origin(python_type)
+        args = get_args(python_type)
+        
+        # Handle List[T]
+        if origin is list:
+            if args:
+                item_schema = self._python_type_to_json_schema(args[0], seen_models)
+                return {"type": "array", "items": item_schema}
+            return {"type": "array"}
+        
+        # Handle Dict[K, V]
+        if origin is dict:
+            if len(args) == 2:
+                value_schema = self._python_type_to_json_schema(args[1], seen_models)
+                return {
+                    "type": "object",
+                    "additionalProperties": value_schema
+                }
+            return {"type": "object"}
+        
+        # Handle Optional[T] / Union[T, None]
+        if origin is Union:
+            non_none_types = [t for t in args if t is not type(None)]
+            
+            # This is Optional[T]
+            if len(non_none_types) == 1:
+                base_schema = self._python_type_to_json_schema(non_none_types[0], seen_models)
+                return {
+                    "anyOf": [
+                        base_schema,
+                        {"type": "null"}
+                    ]
+                }
+            
+            # Multiple non-None types
+            return {
+                "anyOf": [
+                    self._python_type_to_json_schema(t, seen_models) for t in args
+                ]
+            }
+        
+        # Handle Literal (as enum)
+        try:
+            from typing import Literal
+            if origin is Literal:
+                return {"enum": list(args)}
+        except ImportError:
+            pass
+        
+        # Handle nested class with __annotations__
+        if (hasattr(python_type, "__annotations__") and 
+            python_type.__annotations__ and
+            isinstance(python_type, type)):
+            
+            # Recursion Guard
+            if python_type in seen_models:
+                raise ValueError(
+                    f"Circular dependency detected for class {python_type.__name__}. "
+                    "Recursive schemas are not currently supported."
+                )
+            
+            # Recursively convert nested class
+            nested_schema = self._convert_class_to_schema(python_type, seen_models=seen_models)
+            # Return just the schema part, not the full wrapper
+            return nested_schema["json_schema"]["schema"]
+        
+        # Basic types
+        type_name = getattr(python_type, "__name__", str(python_type)).lower()
+        
+        basic_mapping = {
+            "str": "string",
+            "int": "integer",
+            "float": "number",
+            "bool": "boolean",
+            "list": "array",
+            "dict": "object",
+        }
+        
+        json_type = basic_mapping.get(type_name, "string")
+        return {"type": json_type}
+
+    def _convert_class_to_schema(self, schema_class: type, name: Optional[str] = None, seen_models: set = None) -> Dict[str, Any]:
+        """Convert plain class with __annotations__ to OpenAI JSON schema."""
+        
+        if seen_models is None:
+            seen_models = set()
+            
+        # Add current class to seen set to prevent recursion
+        seen_models.add(schema_class)
+        
+        # Check if class has annotations
+        if not hasattr(schema_class, "__annotations__") or not schema_class.__annotations__:
+            raise ValueError(
+                f"Class {schema_class.__name__} has no type annotations. "
+                "Ensure class fields are annotated."
+            )
+        
+        hints = get_type_hints(schema_class)
+        properties = {}
+        required = []
+        
+        # Get class-level defaults
+        class_defaults = {}
+        for key, value in schema_class.__dict__.items():
+            # Skip private attributes and methods
+            if not key.startswith("_") and not callable(value):
+                class_defaults[key] = value
+        
+        # Process each annotated field
+        for field_name, field_type in hints.items():
+            properties[field_name] = self._python_type_to_json_schema(field_type, seen_models)
+            
+            # Check if type is Optional (Union[..., NoneType])
+            is_optional = False
+            origin = get_origin(field_type)
+            if origin is Union:
+                if type(None) in get_args(field_type):
+                    is_optional = True
+
+            # Field is required if it has no default value AND is not Optional
+            if field_name not in class_defaults and not is_optional:
+                required.append(field_name)
+        
+        # Get class docstring as schema description
+        description = inspect.getdoc(schema_class)
+        
+        schema = {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False
+        }
+        
+        if description:
+            schema["description"] = description
+        
+        # Remove from seen set after processing
+        seen_models.remove(schema_class)
+        
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": name or schema_class.__name__,
+                "strict": True,
+                "schema": schema
+            }
+        }
+
+    def _prepare_output_format(self, output_format: Union[Dict, type, None]) -> Optional[Dict]:
+        """
+        Convert output_format to OpenAI schema format.
         
         Args:
-            python_type: A Python type annotation
-            
-        Returns:
-            JSON Schema type string
-        """
-        type_name = getattr(python_type, "__name__", None)
-        if type_name is None:
-            type_str = str(python_type)
-            # Handle Optional, Union types
-            if "Optional" in type_str or "Union" in type_str:
-                # Extract the first inner type
-                inner = type_str.split("[", 1)[1].rsplit("]", 1)[0].split(",")[0].strip()
-                type_name = inner.replace("typing.", "").lower()
-            else:
-                type_name = type_str.split("[", 1)[0].replace("typing.", "").lower()
+            output_format: 
+                - None: No structured output
+                - Dict: OpenAI schema (passthrough)
+                - type: Plain class with __annotations__ (will be converted)
         
-        return self.TYPE_MAPPING.get(type_name.lower() if type_name else "str", "string")
+        Returns:
+            OpenAI-compatible schema dict or None
+        
+        Raises:
+            ValueError: If output_format type is unsupported
+        """
+        if output_format is None:
+            return None
+        
+        # Dict: assume it's already in OpenAI format
+        if isinstance(output_format, dict):
+            return output_format
+        
+        # Type: convert to schema
+        if isinstance(output_format, type):
+            return self._convert_class_to_schema(output_format)
+        
+        raise ValueError(
+            f"output_format must be dict, type, or None. Got: {type(output_format)}"
+        )
 
     def _prepare_tools(self, tools: Optional[List]) -> tuple[List[Dict], Dict[str, Callable]]:
         """
@@ -100,11 +267,11 @@ class LLM:
                     
                     # Get type from annotations if available
                     if param_name in param_annotations:
-                        json_type = self._get_json_type(param_annotations[param_name])
+                        param_schema = self._python_type_to_json_schema(param_annotations[param_name])
                     else:
-                        json_type = "string"
+                        param_schema = {"type": "string"}
                     
-                    parameters[param_name] = {"type": json_type}
+                    parameters[param_name] = param_schema
                     
                     # Check if parameter has no default value → required
                     if param_obj.default == inspect.Parameter.empty:
@@ -123,7 +290,18 @@ class LLM:
                     }
                 }
             elif isinstance(_tools[i], dict):
-                continue
+                # Validate tool dict has required structure
+                tool_dict = _tools[i]
+                if "type" not in tool_dict or "function" not in tool_dict:
+                    raise ValueError(
+                        f"Tool dict at index {i} must have 'type' and 'function' keys. "
+                        "Expected format: {'type': 'function', 'function': {'name': ..., 'parameters': ...}}"
+                    )
+                func_def = tool_dict.get("function", {})
+                if "name" not in func_def:
+                    raise ValueError(
+                        f"Tool dict at index {i} missing 'name' in function definition."
+                    )
             else:
                 raise ValueError("tools must be a list of callables or dicts")
         
@@ -137,7 +315,13 @@ class LLM:
         Args:
             messages: List of message dicts to process
         """
-        from PIL import Image
+        try:
+            from PIL import Image
+        except ImportError:
+            raise ImportError(
+                "PIL/Pillow is required for image processing in vLLM mode. "
+                "Install it with: pip install Pillow"
+            )
         
         for msg in messages:
             if "content" not in msg:
@@ -186,45 +370,54 @@ class LLM:
                         url_data = {"url": url_data}
                     msg["content"][i] = {"type": "image_url", "image_url": url_data}
 
-    def _parse_thinking_content(self, content: str, inside_think: bool) -> tuple[str, bool, str, str]:
+    def _parse_thinking_content(self, content: str, inside_think: bool) -> tuple[bool, str, str]:
         """
-        Parse thinking tags from content (case-insensitive).
+        Parse thinking tags from content (case-insensitive) in a more robust way.
         
         Args:
             content: The content string to parse
             inside_think: Current thinking state
             
         Returns:
-            Tuple of (cleaned_content, new_inside_think, thinking_part, answer_part)
+            Tuple of (new_inside_think, thinking_part, answer_part)
         """
         thinking_part = ""
         answer_part = ""
         
-        # Case-insensitive tag detection and removal
-        content_check = content.lower()
+        remaining_content = content
         
-        if "<think>" in content_check or "[think]" in content_check:
-            inside_think = True
-            content = re.sub(r'<think>|\[THINK\]', '', content, flags=re.IGNORECASE)
-        
-        if "</think>" in content_check or "[/think]" in content_check:
-            # Split content at closing tag
-            parts = re.split(r'</think>|\[/THINK\]', content, flags=re.IGNORECASE)
-            if len(parts) > 1:
-                thinking_part = parts[0]
-                answer_part = parts[1]
-                inside_think = False
-                return "", inside_think, thinking_part, answer_part
+        while remaining_content:
+            if inside_think:
+                # Look for end tag
+                end_match = re.search(r'</think>|\[/THINK\]', remaining_content, flags=re.IGNORECASE)
+                if end_match:
+                    # Found end tag -> up to tag is thought, rest is processed next loop
+                    thought = remaining_content[:end_match.start()]
+                    thinking_part += thought
+                    
+                    inside_think = False
+                    remaining_content = remaining_content[end_match.end():]
+                else:
+                    # No end tag -> all is thought
+                    thinking_part += remaining_content
+                    remaining_content = ""
             else:
-                inside_think = False
-                content = re.sub(r'</think>|\[/THINK\]', '', content, flags=re.IGNORECASE)
-        
-        if inside_think:
-            thinking_part = content
-        else:
-            answer_part = content
-            
-        return content, inside_think, thinking_part, answer_part
+                # Look for start tag
+                start_match = re.search(r'<think>|\[THINK\]', remaining_content, flags=re.IGNORECASE)
+                if start_match:
+                    # Found start tag -> up to tag is answer
+                    answer = remaining_content[:start_match.start()]
+                    answer_part += answer
+                    
+                    inside_think = True
+                    # Skip the tag itself
+                    remaining_content = remaining_content[start_match.end():]
+                else:
+                    # No start tag -> all is answer
+                    answer_part += remaining_content
+                    remaining_content = ""
+                    
+        return inside_think, thinking_part, answer_part
 
     def _unload_other_models(self) -> None:
         """Unload all models except the current one in LM Studio."""
@@ -235,7 +428,7 @@ class LLM:
             if loaded_model.identifier != self.model:
                 loaded_model.unload()
 
-    def response(self, messages: List[Dict[str, Any]] = None, output_format: Dict = None, 
+    def response(self, messages: List[Dict[str, Any]] = None, output_format: Union[Dict, type, None] = None, 
                  tools: List = None, lm_studio_unload_model: bool = False, 
                  hide_thinking: bool = True) -> Optional[Dict[str, Any]]:
         """
@@ -243,7 +436,7 @@ class LLM:
         
         Args:
             messages: List of conversation messages
-            output_format: JSON schema for structured output
+            output_format: JSON schema (dict) or plain class (type) for structured output
             tools: List of callable functions or tool definitions
             lm_studio_unload_model: Whether to unload other models in LM Studio
             hide_thinking: Whether to hide reasoning tokens
@@ -258,6 +451,10 @@ class LLM:
         """
         if messages is None:
             raise ValueError("messages must be provided")
+
+        # Convert class to schema if needed
+        output_format = self._prepare_output_format(output_format)
+
 
         response = self.stream_response(
             messages=messages,
@@ -279,7 +476,7 @@ class LLM:
         
         return final_content
 
-    def stream_response(self, messages: List[Dict] = None, output_format: Dict = None, 
+    def stream_response(self, messages: List[Dict] = None, output_format: Union[Dict, type, None] = None, 
                         final: bool = False, tools: List = None,
                         lm_studio_unload_model: bool = False, 
                         hide_thinking: bool = True) -> Any:
@@ -288,7 +485,7 @@ class LLM:
         
         Args:
             messages: List of conversation messages
-            output_format: JSON schema for structured output
+            output_format: JSON schema (dict) or plain class (type) for structured output
             final: Whether to yield a final aggregated response
             tools: List of callable functions or tool definitions
             lm_studio_unload_model: Whether to unload other models in LM Studio
@@ -299,6 +496,9 @@ class LLM:
         """
         if messages is None:
             raise ValueError("messages must be provided")
+
+        # Convert class to schema if needed
+        output_format = self._prepare_output_format(output_format)
 
         # Prepare tools using helper method
         _tools, callable_tools = self._prepare_tools(tools)
@@ -318,8 +518,9 @@ class LLM:
                 "model": self.model,
                 "messages": messages,
                 "stream": True,
-                "tools": _tools if _tools else [],
             }
+            if _tools:
+                kwargs["tools"] = _tools
             if structured_output:
                 kwargs["response_format"] = output_format
             
@@ -347,7 +548,7 @@ class LLM:
                 continue
 
             if content:
-                _, inside_think, thinking_part, answer_part = self._parse_thinking_content(
+                inside_think, thinking_part, answer_part = self._parse_thinking_content(
                     str(content), inside_think
                 )
                 
@@ -367,8 +568,9 @@ class LLM:
                     yield {"type": "reasoning", "content": reasoning}
 
             if tool_calls:
-                for tool_call in tool_calls:
-                    tool_id = tool_call.id or str(uuid.uuid4())
+                for idx, tool_call in enumerate(tool_calls):
+                    # Use ID if available, otherwise use index for consistent tracking
+                    tool_id = tool_call.id if tool_call.id else f"_idx_{idx}"
                     funct = tool_call.function
                     if tool_id not in tool_calls_accumulator:
                         tool_calls_accumulator[tool_id] = {"name": funct.name or "", "arguments": ""}
@@ -381,16 +583,10 @@ class LLM:
                         tool_calls_accumulator[tool_id]["arguments"] += args_val or ""
 
         if structured_output:
-            temp_answer = answer
             try:
-                data = json.loads(answer)
+                answer = json.loads(answer)
             except json.JSONDecodeError:
-                try:
-                    decoded = answer.encode('utf-8').decode('unicode_escape')
-                    data = json.loads(decoded)
-                except Exception:
-                    data = temp_answer
-            answer = data
+                pass  # Keep answer as raw string if JSON parsing fails
             yield {"type": "answer", "content": answer}
 
         # Build final tool calls list
@@ -412,6 +608,17 @@ class LLM:
             if tool_name in callable_tools:
                 try:
                     func_to_call = callable_tools[tool_name]
+                    
+                    # Check if async function passed to sync method
+                    if inspect.iscoroutinefunction(func_to_call):
+                        error_content = {
+                            "name": tool_name,
+                            "error": f"Async tool '{tool_name}' cannot be executed in sync mode. Use async_stream_response instead."
+                        }
+                        yield {"type": "tool_error", "content": error_content}
+                        remaining_tool_calls.append(tool_call)
+                        continue
+                    
                     result = func_to_call(**tool_call["arguments"])
 
                     tool_result_content = {
@@ -426,7 +633,11 @@ class LLM:
                     }
 
                 except Exception as e:
-                    print(f"Error executing tool {tool_name}: {e}")
+                    error_content = {
+                        "name": tool_name,
+                        "error": str(e)
+                    }
+                    yield {"type": "tool_error", "content": error_content}
 
             else:
                 remaining_tool_calls.append(tool_call)
@@ -446,7 +657,7 @@ class LLM:
             yield {"type": "final", "content": content}
         yield {"type": "done", "content": None}
 
-    async def async_response(self, messages: List[Dict[str, Any]] = None, output_format: Dict = None, 
+    async def async_response(self, messages: List[Dict[str, Any]] = None, output_format: Union[Dict, type, None] = None, 
                              tools: List = None, lm_studio_unload_model: bool = False, 
                              hide_thinking: bool = True) -> Optional[Dict[str, Any]]:
         """
@@ -454,7 +665,7 @@ class LLM:
         
         Args:
             messages: List of conversation messages
-            output_format: JSON schema for structured output
+            output_format: JSON schema (dict) or plain class (type) for structured output
             tools: List of callable functions or tool definitions
             lm_studio_unload_model: Whether to unload other models in LM Studio
             hide_thinking: Whether to hide reasoning tokens
@@ -469,6 +680,9 @@ class LLM:
         """
         if messages is None:
             raise ValueError("messages must be provided")
+
+        # Convert class to schema if needed
+        output_format = self._prepare_output_format(output_format)
 
         final_content = None
         async for r in self.async_stream_response(
@@ -488,7 +702,7 @@ class LLM:
         
         return final_content
 
-    async def async_stream_response(self, messages: List[Dict] = None, output_format: Dict = None, 
+    async def async_stream_response(self, messages: List[Dict] = None, output_format: Union[Dict, type, None] = None, 
                                     final: bool = False, tools: List = None, 
                                     lm_studio_unload_model: bool = False, 
                                     hide_thinking: bool = True) -> AsyncGenerator[Dict, None]:
@@ -497,7 +711,7 @@ class LLM:
         
         Args:
             messages: List of conversation messages
-            output_format: JSON schema for structured output
+            output_format: JSON schema (dict) or plain class (type) for structured output
             final: Whether to yield a final aggregated response
             tools: List of callable functions or tool definitions
             lm_studio_unload_model: Whether to unload other models in LM Studio
@@ -508,6 +722,9 @@ class LLM:
         """
         if messages is None:
             raise ValueError("messages must be provided")
+
+        # Convert class to schema if needed
+        output_format = self._prepare_output_format(output_format)
 
         # Prepare tools using helper method
         _tools, callable_tools = self._prepare_tools(tools)
@@ -527,8 +744,9 @@ class LLM:
                 "model": self.model,
                 "messages": messages,
                 "stream": True,
-                "tools": _tools if _tools else [],
             }
+            if _tools:
+                kwargs["tools"] = _tools
             if structured_output:
                 kwargs["response_format"] = output_format
 
@@ -562,7 +780,7 @@ class LLM:
                 continue
 
             if content:
-                _, inside_think, thinking_part, answer_part = self._parse_thinking_content(
+                inside_think, thinking_part, answer_part = self._parse_thinking_content(
                     str(content), inside_think
                 )
                 
@@ -582,8 +800,9 @@ class LLM:
                     yield {"type": "reasoning", "content": reasoning}
 
             if tool_calls:
-                for tool_call in tool_calls:
-                    tool_id = tool_call.id or str(uuid.uuid4())
+                for idx, tool_call in enumerate(tool_calls):
+                    # Use ID if available, otherwise use index for consistent tracking
+                    tool_id = tool_call.id if tool_call.id else f"_idx_{idx}"
                     funct = tool_call.function
                     if tool_id not in tool_calls_accumulator:
                         tool_calls_accumulator[tool_id] = {"name": funct.name or "", "arguments": ""}
@@ -596,16 +815,10 @@ class LLM:
                         tool_calls_accumulator[tool_id]["arguments"] += args_val or ""
 
         if structured_output:
-            temp_answer = answer
             try:
-                data = json.loads(answer)
+                answer = json.loads(answer)
             except json.JSONDecodeError:
-                try:
-                    decoded = answer.encode('utf-8').decode('unicode_escape')
-                    data = json.loads(decoded)
-                except Exception:
-                    data = temp_answer
-            answer = data
+                pass  # Keep answer as raw string if JSON parsing fails
             yield {"type": "answer", "content": answer}
 
         # Build final tool calls list
@@ -644,7 +857,11 @@ class LLM:
                     }
 
                 except Exception as e:
-                    print(f"Error executing async tool {tool_name}: {e}")
+                    error_content = {
+                        "name": tool_name,
+                        "error": str(e)
+                    }
+                    yield {"type": "tool_error", "content": error_content}
 
             else:
                 remaining_tool_calls.append(tool_call)
