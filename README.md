@@ -1,184 +1,610 @@
-# better-llm-sdk 🚀: Universal LLM API Wrapper
+# LLM Wrapper
 
-A versatile Python wrapper built on top of the official `openai` SDK — designed to interface with **any OpenAI-compatible** LLM API, such as **LM Studio**, **Ollama**, or other self-hosted services.
+A universal, production-ready Python wrapper for OpenAI-compatible LLM APIs with advanced features including streaming, tool calling, thinking token parsing, and multi-modal support.
 
-This wrapper simplifies advanced workflows (streaming, multimodal input, function calling, reasoning extraction, etc.) for both **local** and **remote** development.
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
 
 ## ✨ Features
 
-- **🔗 OpenAI API Compatibility:** Works with any API exposing the OpenAI schema (`/v1/chat/completions`).
-- **⚡ Streaming Support:** Yields structured chunks (`answer`, `reasoning`, `tool_call`, `final`).
-- **🧠 Reasoning Extraction**: Separates text inside `<think> … </think>` tags and returns it as a structured "reasoning" field.
-- **🧰 Function / Tool Calls:** Aggregates fragmented tool calls into a structured Python list.
-- **🖼️ Multimodal Input (`vllm_mode`):** Converts local or in-memory images into Base64 `data:image/png;base64,...` URLs.
-- **🧹 LM Studio Model Management:** Optionally unloads other loaded models before inference (`lm_studio_unload_model=True`).
+- 🔄 **Streaming & Non-Streaming Support**: Both sync and async implementations
+- 🛠️ **Tool Calling**: Automatic function execution with OpenAI function calling
+- 🧠 **Thinking Token Parsing**: Extract and handle reasoning tokens (`<think>`, `[THINK]`)
+- 🖼️ **Multi-Modal Support**: Image processing with PIL and base64 encoding
+- 📦 **Structured Output**: JSON schema validation for responses
+- ⚡ **Async/Await**: Full async support for high-performance applications
+- 🔧 **Type-Safe**: Comprehensive type hints for better IDE support
+- 🎯 **Production-Ready**: Robust error handling and validation
 
 ---
 
 ## 📦 Installation
 
+### Prerequisites
+
 ```bash
-# Requires: Python ≥ 3.10 and openai SDK ≥ 1.12.0
-pip install openai
-# Optional dependencies:
-pip install lmstudio pillow
+pip install openai pillow
 ```
 
+### Optional Dependencies
+
+For LM Studio integration:
+```bash
+pip install lmstudio
+```
+
+### Install from Source
+
+```bash
+git clone https://github.com/yourusername/llm-wrapper.git
+cd llm-wrapper
+pip install -e .
+```
 
 ---
 
-## 🧑‍💻 Usage
+## 🚀 Quick Start
 
-### 1️⃣ Initialize the Wrapper
+### Basic Usage
+
 ```python
 from llm_wrapper import LLM
 
+# Initialize the wrapper
 llm = LLM(
-    model="openai/gpt-oss-20b",
-    base_url="http://localhost:1234/v1",
-    api_key="lm-studio"
+    model="gpt-4",
+    base_url="http://localhost:1234/v1",  # Your API endpoint
+    api_key="your-api-key"
 )
-```
 
-### 2️⃣ Basic Chat
-```python
+# Simple request
 messages = [
-    {"role": "user", "content": [{"type": "text", "text": "Solve 2+2*3"}]}
+    {"role": "user", "content": "Hello, how are you?"}
 ]
-response = llm.response(messages=messages)
+
+response = llm.response(messages)
 print(response["answer"])
 ```
 
-**Output:**
+### Streaming Response
+
+```python
+for chunk in llm.stream_response(messages):
+    if chunk["type"] == "answer":
+        print(chunk["content"], end="", flush=True)
+```
+
+### Async Usage
+
+```python
+import asyncio
+
+async def main():
+    llm = LLM(model="gpt-4")
+    messages = [{"role": "user", "content": "Tell me a joke"}]
+    
+    response = await llm.async_response(messages)
+    print(response["answer"])
+
+asyncio.run(main())
+```
+
+---
+
+## 📖 Documentation
+
+### Initialization
+
+```python
+LLM(
+    model: str,
+    vllm_mode: bool = False,
+    api_key: str = "lm-studio",
+    base_url: str = "http://localhost:1234/v1"
+)
+```
+
+**Parameters:**
+- `model`: Model identifier (e.g., `"gpt-4"`, `"llama-3.1-8b"`)
+- `vllm_mode`: Enable vLLM-specific image processing
+- `api_key`: API authentication key
+- `base_url`: API endpoint URL
+
+---
+
+### Methods
+
+#### `response()`
+
+Non-streaming synchronous inference.
+
+```python
+response = llm.response(
+    messages: List[Dict[str, Any]],
+    output_format: Dict = None,
+    tools: List = None,
+    lm_studio_unload_model: bool = False,
+    hide_thinking: bool = True
+) -> Dict[str, Any]
+```
+
+**Parameters:**
+- `messages`: List of conversation messages
+- `output_format`: JSON schema for structured output
+- `tools`: List of callable functions or tool definitions
+- `lm_studio_unload_model`: Unload other models in LM Studio
+- `hide_thinking`: Hide reasoning tokens from output
+
+**Returns:**
 ```python
 {
-    "reasoning": "...model reasoning...",
-    "answer": "8",
-    "tool_calls": []
+    "answer": "Response text or structured data",
+    "reasoning": "Thinking process (if hide_thinking=False)",
+    "tool_calls": [...],  # Unanswered tool calls
+    "tool_results": [...]  # Executed tool results
 }
 ```
 
 ---
 
-### 3️⃣ Streaming Responses
+#### `stream_response()`
+
+Streaming synchronous inference.
+
 ```python
 for chunk in llm.stream_response(
-    messages=messages,
-    final=True # adds a final structured summary chunk at the end of the stream
+    messages: List[Dict],
+    output_format: Dict = None,
+    final: bool = False,
+    tools: List = None,
+    lm_studio_unload_model: bool = False,
+    hide_thinking: bool = True
 ):
-    print(chunk["content"])
+    # Process chunk
+    pass
 ```
 
-**Chunk examples:**
+**Yields:**
 ```python
-{"type": "reasoning", "content": "Chain of Thought (if reasoning model)"}
-{"type": "answer", "content": "8"}
-{"type": "tool_call", "content": {...}}
-{"type": "tool_result", "content": {"name": "tool name", "result": "..."}}
-{"type": "final", "content": {...}}
-{"type":"done", "content": None}
+{"type": "reasoning", "content": "..."}   # Thinking tokens
+{"type": "answer", "content": "..."}      # Response chunks
+{"type": "tool_call", "content": {...}}   # Tool to be called (dict schemas)
+{"type": "tool_result", "content": {...}}  # Executed tool result
+{"type": "tool_error", "content": {...}}   # Tool execution error
+{"type": "final", "content": {...}}       # Final aggregated response
+{"type": "done", "content": None}         # Stream end marker
 ```
 
 ---
 
-### 4️⃣ Multimodal Example (Image Input)
+#### `async_response()` & `async_stream_response()`
+
+Asynchronous versions of the above methods with identical signatures.
+
 ```python
-llm = LLM(model="qwen3-vl-4b-thinking", vllm_mode=True)
+# Async non-streaming
+response = await llm.async_response(messages)
+
+# Async streaming
+async for chunk in llm.async_stream_response(messages):
+    print(chunk)
+```
+
+---
+
+### Tool Calling
+
+Define tools as Python functions with type hints:
+
+```python
+def get_weather(city: str, unit: str = "celsius") -> dict:
+    """Get the current weather for a city.
+    
+    Args:
+        city: The name of the city
+        unit: Temperature unit (celsius or fahrenheit)
+    """
+    # Your implementation
+    return {"temperature": 22, "condition": "sunny"}
+
+# You can also use OpenAI standard schema format (dict):
+search_tool_schema = {
+    "type": "function",
+    "function": {
+        "name": "search_internet",
+        "description": "Search the internet for information",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+# Use both callable functions and dict schemas together
+messages = [
+    {"role": "user", "content": "What's the weather in Paris?"}
+]
+
+response = llm.response(
+    messages=messages,
+    tools=[get_weather, search_tool_schema]  # Mix both formats
+)
+
+print(response)
+# Callable tools (get_weather) are executed automatically
+# Dict schemas are returned in tool_calls for manual handling
+```
+
+**Tool Flow:**
+1. **Callable functions** are auto-converted to OpenAI tool schema
+2. Required parameters are detected via `inspect.signature()`
+3. Callable tools are **executed automatically**
+4. Results are included in `tool_results`
+5. **Dict schemas** are passed through and returned in `tool_calls`
+6. You can mix both formats in the same `tools` list
+7. **Async tools** in sync methods yield `tool_error` (use async methods instead)
+
+
+---
+
+### Structured Output
+
+Define your output schema as a plain Python class:
+
+```python
+from typing import List, Optional
+from llm_wrapper import LLM
+
+class PersonInfo:
+    """Information about a person."""
+    name: str = "Unknown"  # Has default → optional
+    age: int               # Required (no default)
+    hobbies: List[str]     # Required (no default)
+    email: Optional[str]   # Implicitly optional (None default)
+
+llm = LLM(model="gpt-4")
+messages = [
+    {"role": "user", "content": "Tell me about Alice, 28, likes coding and reading"}
+]
+
+response = llm.response(messages, output_format=PersonInfo)
+print(response["answer"])
+# Output: {"name": "Alice", "age": 28, "hobbies": ["coding", "reading"], "email": null}
+```
+
+**Features:**
+- ✅ **Required fields**: No default value defined
+- ✅ **Optional fields**: Has default value defined
+- ✅ **Nested classes**: Automatically converted
+- ✅ **Lists and Dicts**: Full support
+- ✅ **Class docstring**: Added to schema description
+
+**Still works - Dict Schema:**
+
+```python
+schema = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "person_info",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            }
+        }
+    }
+}
+response = llm.response(messages, output_format=schema)
+```
+
+---
+
+### Multi-Modal (Images)
+
+#### From File Path
+
+```python
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image", "image_path": "/path/to/image.jpg"}
+        ]
+    }
+]
+
+llm = LLM(model="gpt-4-vision", vllm_mode=True)
+response = llm.response(messages)
+```
+
+#### From PIL Image
+
+```python
+from PIL import Image
+
+img = Image.open("photo.jpg")
 
 messages = [
     {
         "role": "user",
         "content": [
-            {"type": "text", "text": "What's in this picture?"},
-            {"type": "image", "image_path": "example.png"},
-            #{"type": "image", "image_url": "example.com/image.png"}
-            #{"type": "image", "image_pil": PIL Image object}
+            {"type": "text", "text": "Describe this image"},
+            {"type": "image", "image_pil": img}
         ]
     }
 ]
 
-response = llm.response(messages=messages)
-print(response["answer"])
+response = llm.response(messages)
+```
+
+#### From URL
+
+```python
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What do you see?"},
+            {"type": "image", "image_url": "https://example.com/image.jpg"}
+        ]
+    }
+]
 ```
 
 ---
 
-### 5️⃣ Using Tools / Functions
+### Thinking Tokens
+
+Models can output reasoning tokens that are parsed and separated:
+
 ```python
+# Model outputs: <think>Let me analyze this...</think>The answer is 42.
+# Or: [THINK]Reasoning here[/THINK]Answer here.
 
-def get_weather(location: str): # converts callable tools to OpenAI-style tool definitions, runs them automatically and returns the result in the response
-    """Weather tool, gives weather at location
+response = llm.response(messages, hide_thinking=False)
 
-    param location: string
-    return: string with weather information
+print(response["reasoning"])  # "Let me analyze this..." or "Reasoning here"
+print(response["answer"])      # "The answer is 42." or "Answer here."
+```
+
+Supported formats:
+- `<think>...</think>`
+- `[THINK]...[/THINK]`
+- Case-insensitive
+
+---
+
+### LM Studio Integration
+
+```python
+llm = LLM(
+    model="local-model",
+    base_url="http://localhost:1234/v1"
+)
+
+# Count tokens
+token_count = llm.lm_studio_count_tokens("Hello, world!")
+print(f"Tokens: {token_count}")
+
+# Get context length
+context_length = llm.lm_studio_get_context_length()
+print(f"Max context: {context_length}")
+
+# Auto-unload other models before inference
+response = llm.response(
+    messages=messages,
+    lm_studio_unload_model=True
+)
+```
+
+---
+
+## 💡 Examples
+
+### Complete Chatbot Example
+
+```python
+from llm_wrapper import LLM
+
+def chat():
+    llm = LLM(model="gpt-4")
+    messages = []
+    
+    print("Chatbot started. Type 'quit' to exit.\n")
+    
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == "quit":
+            break
+        
+        messages.append({"role": "user", "content": user_input})
+        
+        print("Bot: ", end="", flush=True)
+        full_response = ""
+        
+        for chunk in llm.stream_response(messages, final=True):
+            if chunk["type"] == "answer":
+                print(chunk["content"], end="", flush=True)
+                full_response += chunk["content"]
+            elif chunk["type"] == "final":
+                full_response = chunk["content"]["answer"]
+        
+        print()  # New line
+        messages.append({"role": "assistant", "content": full_response})
+
+if __name__ == "__main__":
+    chat()
+```
+
+### Async Batch Processing
+
+```python
+import asyncio
+from llm_wrapper import LLM
+
+async def process_batch(prompts: list[str]):
+    llm = LLM(model="gpt-4")
+    
+    tasks = [
+        llm.async_response([{"role": "user", "content": p}])
+        for p in prompts
+    ]
+    
+    results = await asyncio.gather(*tasks)
+    return [r["answer"] for r in results]
+
+prompts = [
+    "Translate 'hello' to French",
+    "What's 2+2?",
+    "Name a color"
+]
+
+results = asyncio.run(process_batch(prompts))
+for prompt, result in zip(prompts, results):
+    print(f"Q: {prompt}\nA: {result}\n")
+```
+
+### Agent with Tools
+
+```python
+from llm_wrapper import LLM
+import datetime
+
+def get_current_time() -> str:
+    """Get the current time."""
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+def set_reminder(message: str, minutes: int) -> str:
+    """Set a reminder.
+    
+    Args:
+        message: The reminder message
+        minutes: Minutes until reminder
     """
-    return "sunny, 25 degrees Celsius"
+    return f"Reminder '{message}' set for {minutes} minutes from now"
 
-sum_tool = { # gives back a tool call
-    "type": "function",
-    "function": {
-        "name": "add",
-        "description": "Add two numbers",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "a": {"type": "number"},
-                "b": {"type": "number"}
-            },
-            "required": ["a", "b"]
-        }
-    }
-}
+llm = LLM(model="gpt-4")
 
-tools=[sum_tool, get_weather]
+messages = [
+    {"role": "user", "content": "What time is it? And remind me to call mom in 30 minutes"}
+]
 
-response = llm.response(messages=messages, tools=tools)
-print(response["answer"])
+response = llm.response(
+    messages=messages,
+    tools=[get_current_time, set_reminder]
+)
+
+print("Answer:", response["answer"])
+print("\nExecuted Tools:")
+for result in response.get("tool_results", []):
+    print(f"  {result['name']}: {result['result']}")
 ```
+
 ---
 
-### 6️⃣ Structured Output
+## 🔧 Advanced Configuration
+
+### Custom Error Handling
+
 ```python
-output_format = {
-    "type": "json_schema",
-    "json_schema": {
-        "schema":{
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string"
-                },
-            },
-            "required": [
-                "name"
-            ]
-        }
-    }
-}
-
-response = llm.response(messages=messages, output_format=output_format)
-print(response["answer"]) # JSON object if successful
+try:
+    response = llm.response(messages)
+except ValueError as e:
+    print(f"Validation error: {e}")
+except RuntimeError as e:
+    print(f"API error: {e}")
 ```
-Requires an API endpoint that supports the `response_format` parameter (e.g. OpenAI `gpt-4o` or LM Studio with JSON schema support). ⚠️
+
+### Message Format
+
+```python
+messages = [
+    {
+        "role": "system",
+        "content": "You are a helpful assistant."
+    },
+    {
+        "role": "user",
+        "content": "Hello!"
+    },
+    {
+        "role": "assistant",
+        "content": "Hi! How can I help?"
+    },
+    {
+        "role": "user",
+        "content": "What's the weather?"
+    }
+]
+```
 
 ---
 
-## ⚙️ Parameters Overview
+## 🧪 Testing
 
-| Parameter | Type | Default | Description |
-|------------|------|----------|-------------|
-| `model` | `str` | — | The model name (e.g. `"gpt-4"`, `"qwen3-8b"`) |
-| `base_url` | `str` | `"http://localhost:1234/v1"` | OpenAI-compatible endpoint |
-| `api_key` | `str` | `"lm-studio"` | API key (if required) |
-| `vllm_mode` | `bool` | `False` | Enables local image handling for multimodal inputs |
-| `lm_studio_unload_model` | `bool` | `False` | Automatically unloads other models in LM Studio |
-| `hide_thinking` | `bool` | `True` | If `True`, reasoning (inside `<think>` tags) is hidden from output chunks |
+```python
+# test_llm_wrapper.py
+from llm_wrapper import LLM
+
+def test_basic_response():
+    llm = LLM(model="gpt-4", base_url="http://localhost:1234/v1")
+    messages = [{"role": "user", "content": "Say 'test'"}]
+    response = llm.response(messages)
+    
+    assert "answer" in response
+    assert isinstance(response["answer"], str)
+
+def test_tool_execution():
+    def add(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
+    
+    llm = LLM(model="gpt-4")
+    messages = [{"role": "user", "content": "What is 5 + 3?"}]
+    response = llm.response(messages, tools=[add])
+    
+    assert "tool_results" in response or "answer" in response
+```
+
+---
+
+## 📝 API Reference
+
+### Type Definitions
+
+```python
+Message = Dict[str, Any]  # {"role": str, "content": str | List[Dict]}
+Tool = Callable | Dict[str, Any]
+Schema = Dict[str, Any]
+Response = Dict[str, Any]  # {"answer": Any, "reasoning"?: str, ...}
+Chunk = Dict[str, Any]  # {"type": str, "content": Any}
+```
+
+### Helper Methods
+
+| Method | Description |
+|--------|-------------|
+| `_get_json_type(python_type)` | Convert Python type to JSON Schema type |
+| `_prepare_tools(tools)` | Convert callables to OpenAI format |
+| `_process_images(messages)` | Convert images to base64 |
+| `_parse_thinking_content(content, inside_think)` | Extract thinking tokens |
+| `_unload_other_models()` | Unload LM Studio models |
 
 ---
 
 ## 📄 License
 
-Licensed under the [MIT License](./LICENSE).
-
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
