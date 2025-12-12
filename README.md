@@ -38,7 +38,7 @@ pip install lmstudio pillow
 
 ```bash
 git clone https://github.com/flgaertig/better-llm-sdk.git
-cd llm-wrapper
+cd better-llm-wrapper
 pip install -e .
 ```
 
