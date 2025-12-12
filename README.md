@@ -37,7 +37,7 @@ pip install lmstudio pillow
 ### Install from Source
 
 ```bash
-git clone https://github.com/yourusername/llm-wrapper.git
+git clone https://github.com/flgaertig/better-llm-sdk.git
 cd llm-wrapper
 pip install -e .
 ```
