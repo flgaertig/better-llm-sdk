@@ -309,19 +309,18 @@ class LLM:
 
     def _process_images(self, messages: List[Dict]) -> None:
         """
-        Convert custom image formats to base64 for vLLM mode.
+        Convert custom image formats (image_path, image_pil) to OpenAI-compatible image_url format.
         Modifies messages in-place.
         
         Args:
             messages: List of message dicts to process
         """
+        pil_available = False
         try:
             from PIL import Image
+            pil_available = True
         except ImportError:
-            raise ImportError(
-                "PIL/Pillow is required for image processing in vLLM mode. "
-                "Install it with: pip install Pillow"
-            )
+            pass  # PIL not required if not using image_path or image_pil
         
         for msg in messages:
             if "content" not in msg:
@@ -337,6 +336,11 @@ class LLM:
                     continue
                 
                 if "image_path" in c:
+                    if not pil_available:
+                        raise ImportError(
+                            "PIL/Pillow is required for image_path processing. "
+                            "Install it with: pip install Pillow"
+                        )
                     try:
                         with Image.open(c["image_path"]) as img:
                             buffer = io.BytesIO()
@@ -351,6 +355,11 @@ class LLM:
                         raise ValueError(f"Failed to process image from path: {e}")
                         
                 elif "image_pil" in c:
+                    if not pil_available:
+                        raise ImportError(
+                            "PIL/Pillow is required for image_pil processing. "
+                            "Install it with: pip install Pillow"
+                        )
                     try:
                         img = c["image_pil"]
                         buffer = io.BytesIO()
@@ -421,12 +430,21 @@ class LLM:
 
     def _unload_other_models(self) -> None:
         """Unload all models except the current one in LM Studio."""
-        import lmstudio as lms
-        lms.configure_default_client(self.base_url)
-        all_loaded_models = lms.list_loaded_models()
-        for loaded_model in (all_loaded_models or []):
-            if loaded_model.identifier != self.model:
-                loaded_model.unload()
+        try:
+            import lmstudio as lms
+            # Try to configure, ignore if already configured (singleton)
+            try:
+                lms.configure_default_client(self.base_url)
+            except Exception:
+                pass  # Already configured, continue
+            all_loaded_models = lms.list_loaded_models()
+            for loaded_model in (all_loaded_models or []):
+                if loaded_model.identifier != self.model:
+                    loaded_model.unload()
+        except ImportError:
+            pass  # lmstudio not installed, skip
+        except Exception:
+            pass  # Ignore errors in unloading
 
     def response(self, messages: List[Dict[str, Any]] = None, output_format: Union[Dict, type, None] = None, 
                  tools: List = None, lm_studio_unload_model: bool = False, 
@@ -503,9 +521,8 @@ class LLM:
         # Prepare tools using helper method
         _tools, callable_tools = self._prepare_tools(tools)
 
-        # Process images if in vLLM mode
-        if self.vllm_mode:
-            self._process_images(messages)
+        # Always process custom image formats (image_path, image_pil, image_url)
+        self._process_images(messages)
 
         # Unload other models if requested
         if lm_studio_unload_model:
@@ -729,9 +746,8 @@ class LLM:
         # Prepare tools using helper method
         _tools, callable_tools = self._prepare_tools(tools)
 
-        # Process images if in vLLM mode
-        if self.vllm_mode:
-            self._process_images(messages)
+        # Always process custom image formats (image_path, image_pil, image_url)
+        self._process_images(messages)
 
         # Unload other models if requested
         if lm_studio_unload_model:
@@ -894,12 +910,22 @@ class LLM:
         Raises:
             RuntimeError: If tokenization fails
         """
-        import lmstudio as lms
-        lms.configure_default_client(self.base_url)
         try:
+            import lmstudio as lms
+            # LM Studio SDK expects base URL without /v1 suffix
+            sdk_url = self.base_url.rstrip('/').removesuffix('/v1')
+            
+            # Try to configure, ignore if already configured (singleton)
+            try:
+                lms.configure_default_client(sdk_url)
+            except Exception:
+                pass  # Already configured, continue
+            
             model = lms.llm(self.model)
             tokens = model.tokenize(input_text)
             return len(tokens)
+        except ImportError:
+            raise RuntimeError("lmstudio package not installed. Install with: pip install lmstudio")
         except Exception as e:
             raise RuntimeError(f"Could not count tokens for {self.model}: {e}")
 
@@ -910,7 +936,20 @@ class LLM:
         Returns:
             Context length in tokens
         """
-        import lmstudio as lms
-        lms.configure_default_client(self.base_url)
-        model = lms.llm(self.model)
-        return model.get_context_length()
+        try:
+            import lmstudio as lms
+            # LM Studio SDK expects base URL without /v1 suffix
+            sdk_url = self.base_url.rstrip('/').removesuffix('/v1')
+            
+            # Try to configure, ignore if already configured (singleton)
+            try:
+                lms.configure_default_client(sdk_url)
+            except Exception:
+                pass  # Already configured, continue
+            
+            model = lms.llm(self.model)
+            return model.get_context_length()
+        except ImportError:
+            raise RuntimeError("lmstudio package not installed. Install with: pip install lmstudio")
+        except Exception as e:
+            raise RuntimeError(f"Could not get context length for {self.model}: {e}")
