@@ -52,7 +52,7 @@ from llm_wrapper import LLM
 
 # Initialize the wrapper
 llm = LLM(
-    model="gpt-4",
+    model="qwen3-vl-4b-thinking",
     base_url="http://localhost:1234/v1",  # Your API endpoint
     api_key="your-api-key"
 )
@@ -80,7 +80,7 @@ for chunk in llm.stream_response(messages):
 import asyncio
 
 async def main():
-    llm = LLM(model="gpt-4")
+    llm = LLM(model="qwen3-vl-4b-thinking")
     messages = [{"role": "user", "content": "Tell me a joke"}]
     
     response = await llm.async_response(messages)
@@ -105,7 +105,7 @@ LLM(
 ```
 
 **Parameters:**
-- `model`: Model identifier (e.g., `"gpt-4"`, `"llama-3.1-8b"`)
+- `model`: Model identifier (e.g., `"qwen3-4b"`, `"llama-3.1-8b"`)
 - `vllm_mode`: Enable vLLM-specific image processing
 - `api_key`: API authentication key
 - `base_url`: API endpoint URL
