@@ -15,8 +15,6 @@ A universal, production-ready Python wrapper for OpenAI-compatible LLM APIs with
 - 🖼️ **Multi-Modal Support**: Image processing with PIL and base64 encoding
 - 📦 **Structured Output**: JSON schema validation for responses
 - ⚡ **Async/Await**: Full async support for high-performance applications
-- 🔧 **Type-Safe**: Comprehensive type hints for better IDE support
-- 🎯 **Production-Ready**: Robust error handling and validation
 
 ---
 
