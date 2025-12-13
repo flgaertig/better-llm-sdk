@@ -1,6 +1,6 @@
-# LLM Wrapper
+# LLM SDK
 
-A universal, production-ready Python wrapper for OpenAI-compatible LLM APIs with advanced features including streaming, tool calling, thinking token parsing, and multi-modal support.
+A universal, production-ready Python sdk for OpenAI-compatible LLM APIs with advanced features including streaming, tool calling, thinking token parsing, and multi-modal support.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -46,9 +46,9 @@ cd better-llm-sdk
 ### Basic Usage
 
 ```python
-from llm_wrapper import LLM
+from llm_sdk import LLM
 
-# Initialize the wrapper
+# Initialize the sdk
 llm = LLM(
     model="qwen3-vl-4b-thinking",
     base_url="http://localhost:1234/v1",  # Your API endpoint
@@ -261,7 +261,7 @@ Define your output schema as a plain Python class:
 
 ```python
 from typing import List, Optional
-from llm_wrapper import LLM
+from llm_sdk import LLM
 
 class PersonInfo:
     """Information about a person."""
@@ -413,7 +413,7 @@ response = llm.response(
 ### Complete Chatbot Example
 
 ```python
-from llm_wrapper import LLM
+from llm_sdk import LLM
 
 def chat():
     llm = LLM(model="gpt-4")
@@ -449,7 +449,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-from llm_wrapper import LLM
+from llm_sdk import LLM
 
 async def process_batch(prompts: list[str]):
     llm = LLM(model="gpt-4")
@@ -476,7 +476,7 @@ for prompt, result in zip(prompts, results):
 ### Agent with Tools
 
 ```python
-from llm_wrapper import LLM
+from llm_sdk import LLM
 import datetime
 
 def get_current_time() -> str:
@@ -552,8 +552,8 @@ messages = [
 ## 🧪 Testing
 
 ```python
-# test_llm_wrapper.py
-from llm_wrapper import LLM
+# test_llm_sdk.py
+from llm_sdk import LLM
 
 def test_basic_response():
     llm = LLM(model="gpt-4", base_url="http://localhost:1234/v1")
