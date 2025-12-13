@@ -17,7 +17,7 @@ class LLM:
     def __init__(self, model: str, vllm_mode: bool = False, api_key: str = "lm-studio",
                  base_url: str = "http://localhost:1234/v1"):
         """
-        Initialize the wrapper.
+        Initialize the sdk.
         
         Args:
             model: The model identifier to use
@@ -953,3 +953,4 @@ class LLM:
             raise RuntimeError("lmstudio package not installed. Install with: pip install lmstudio")
         except Exception as e:
             raise RuntimeError(f"Could not get context length for {self.model}: {e}")
+
