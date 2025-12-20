@@ -1,34 +1,42 @@
 import json
 import base64
 import re
-import uuid
 from openai import OpenAI, AsyncOpenAI
 import io
 from typing import Any, AsyncGenerator, Dict, Optional, List, Callable, Union, get_type_hints, get_origin, get_args
 import inspect
 import asyncio
 
+__all__ = ["LLM"]
+
 
 class LLM:
-    """Universal api wrapper for LLM models with openai compatible api (e.g., LM Studio)"""
-
-
+    """Universal API wrapper for LLM models with OpenAI-compatible API.
+    
+    Optimized for use with LM Studio, support for structured outputs, 
+    vision models, and tool calling in both synchronous and asynchronous modes.
+    """
 
     def __init__(self, model: str, vllm_mode: bool = False, api_key: str = "lm-studio",
                  base_url: str = "http://localhost:1234/v1"):
-        """
-        Initialize the sdk.
+        """Initialize the LLM wrapper.
         
         Args:
-            model: The model identifier to use
-            vllm_mode: Whether to use vLLM-specific image processing
-            api_key: API key for authentication
-            base_url: Base URL for the API endpoint
+            model: The model identifier to use.
+            vllm_mode: Whether to enable vLLM-specific optimizations (mostly for vision).
+            api_key: API key for authentication. Default is "lm-studio".
+            base_url: Base URL for the API endpoint. Default is "http://localhost:1234/v1".
         """
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
-        self.async_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self.base_url = base_url.rstrip("/")
+        if not self.base_url.endswith("/v1"):
+            self.api_base = self.base_url + "/v1"
+        else:
+            self.api_base = self.base_url
+            self.base_url = self.base_url.removesuffix("/v1").rstrip("/")
+
+        self.client = OpenAI(base_url=self.api_base, api_key=api_key)
+        self.async_client = AsyncOpenAI(base_url=self.api_base, api_key=api_key)
         self.model = model
-        self.base_url = base_url
         self.api_key = api_key
         self.vllm_mode = vllm_mode
 
@@ -130,6 +138,10 @@ class LLM:
             "dict": "object",
         }
         
+        # Fallback for typing._GenericAlias or other complex types
+        if not isinstance(type_name, str):
+            type_name = str(type_name).lower()
+
         json_type = basic_mapping.get(type_name, "string")
         return {"type": json_type}
 
@@ -255,7 +267,12 @@ class LLM:
                 doc = (func.__doc__ or "").strip()
                 
                 # Get parameter annotations and signature
-                param_annotations = func.__annotations__
+                try:
+                    param_annotations = get_type_hints(func)
+                except Exception:
+                    # Fallback if get_type_hints fails (e.g. some decorators/closures)
+                    param_annotations = func.__annotations__
+                    
                 sig = inspect.signature(func)
                 
                 required_params = []
@@ -339,7 +356,6 @@ class LLM:
                     if not pil_available:
                         raise ImportError(
                             "PIL/Pillow is required for image_path processing. "
-                            "Install it with: pip install Pillow"
                         )
                     try:
                         with Image.open(c["image_path"]) as img:
@@ -358,7 +374,6 @@ class LLM:
                     if not pil_available:
                         raise ImportError(
                             "PIL/Pillow is required for image_pil processing. "
-                            "Install it with: pip install Pillow"
                         )
                     try:
                         img = c["image_pil"]
@@ -379,6 +394,15 @@ class LLM:
                         url_data = {"url": url_data}
                     msg["content"][i] = {"type": "image_url", "image_url": url_data}
 
+                elif "image_base64" in c:
+                    base64_data = c["image_base64"]
+                    if isinstance(base64_data, str):
+                        base64_data = {"url": base64_data}
+                    msg["content"][i] = {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{base64_data}"}
+                        }
+
     def _parse_thinking_content(self, content: str, inside_think: bool) -> tuple[bool, str, str]:
         """
         Parse thinking tags from content (case-insensitive) in a more robust way.
@@ -398,7 +422,8 @@ class LLM:
         while remaining_content:
             if inside_think:
                 # Look for end tag
-                end_match = re.search(r'</think>|\[/THINK\]', remaining_content, flags=re.IGNORECASE)
+                # Supports: </think>, </thought>, </thinking>, [/THINK]
+                end_match = re.search(r'</think>|</thought>|</thinking>|\[/THINK\]', remaining_content, flags=re.IGNORECASE)
                 if end_match:
                     # Found end tag -> up to tag is thought, rest is processed next loop
                     thought = remaining_content[:end_match.start()]
@@ -412,7 +437,8 @@ class LLM:
                     remaining_content = ""
             else:
                 # Look for start tag
-                start_match = re.search(r'<think>|\[THINK\]', remaining_content, flags=re.IGNORECASE)
+                # Supports: <think>, <thought>, <thinking>, [THINK]
+                start_match = re.search(r'<think>|<thought>|<thinking>|\[THINK\]', remaining_content, flags=re.IGNORECASE)
                 if start_match:
                     # Found start tag -> up to tag is answer
                     answer = remaining_content[:start_match.start()]
@@ -429,7 +455,7 @@ class LLM:
         return inside_think, thinking_part, answer_part
 
     def _unload_other_models(self) -> None:
-        """Unload all models except the current one in LM Studio."""
+        """Unload all models except the current one in LM Studio to free up resources."""
         try:
             import lmstudio as lms
             # Try to configure, ignore if already configured (singleton)
@@ -484,13 +510,17 @@ class LLM:
         )
 
         final_content = None
+        last_answer = ""
         for r in response:
+            if r["type"] == "answer":
+                last_answer += r["content"] if isinstance(r["content"], str) else ""
             if r["type"] == "final":
                 final_content = r["content"]
                 break
         
         if final_content is None:
-            raise RuntimeError("No final response received from model")
+            # Fallback for models that don't emit a proper done signal in some edge cases
+            return {"answer": last_answer}
         
         return final_content
 
@@ -521,7 +551,7 @@ class LLM:
         # Prepare tools using helper method
         _tools, callable_tools = self._prepare_tools(tools)
 
-        # Always process custom image formats (image_path, image_pil, image_url)
+        # Always process custom image formats (image_path, image_pil, image_url, image_base64)
         self._process_images(messages)
 
         # Unload other models if requested
@@ -898,26 +928,22 @@ class LLM:
         yield {"type": "done", "content": None}
 
     def lm_studio_count_tokens(self, input_text: str) -> int:
-        """
-        Count tokens used in LM Studio.
+        """Count tokens used in LM Studio for the current model.
         
         Args:
-            input_text: The text to tokenize
+            input_text: The text to tokenize.
             
         Returns:
-            Number of tokens
+            Number of tokens.
             
         Raises:
-            RuntimeError: If tokenization fails
+            RuntimeError: If tokenization fails or lmstudio package is missing.
         """
         try:
             import lmstudio as lms
-            # LM Studio SDK expects base URL without /v1 suffix
-            sdk_url = self.base_url.rstrip('/').removesuffix('/v1')
-            
             # Try to configure, ignore if already configured (singleton)
             try:
-                lms.configure_default_client(sdk_url)
+                lms.configure_default_client(self.base_url)
             except Exception:
                 pass  # Already configured, continue
             
@@ -930,20 +956,19 @@ class LLM:
             raise RuntimeError(f"Could not count tokens for {self.model}: {e}")
 
     def lm_studio_get_context_length(self) -> int:
-        """
-        Get the context length of the model in LM Studio.
+        """Get the context length of the model in LM Studio.
         
         Returns:
-            Context length in tokens
+            Context length in tokens.
+            
+        Raises:
+            RuntimeError: If lookup fails or lmstudio package is missing.
         """
         try:
             import lmstudio as lms
-            # LM Studio SDK expects base URL without /v1 suffix
-            sdk_url = self.base_url.rstrip('/').removesuffix('/v1')
-            
             # Try to configure, ignore if already configured (singleton)
             try:
-                lms.configure_default_client(sdk_url)
+                lms.configure_default_client(self.base_url)
             except Exception:
                 pass  # Already configured, continue
             
@@ -953,4 +978,3 @@ class LLM:
             raise RuntimeError("lmstudio package not installed. Install with: pip install lmstudio")
         except Exception as e:
             raise RuntimeError(f"Could not get context length for {self.model}: {e}")
-
