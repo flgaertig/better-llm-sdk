@@ -4,7 +4,6 @@
 > The SDK has been merged into a new, unified AI SDK with more features, embeddings support, and RAG.  
 > Check out the latest version here: [Local AI SDK](https://github.com/flgaertig/Local-AI-SDK)
 
----
 A universal, production-ready Python sdk for OpenAI-compatible LLM APIs with advanced features including streaming, tool calling, thinking token parsing, and multi-modal support.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
