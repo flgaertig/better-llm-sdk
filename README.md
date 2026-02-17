@@ -26,22 +26,22 @@ A universal, production-ready Python SDK for OpenAI-compatible LLM APIs with adv
 
 ### Prerequisites
 
-'''bash
+```bash
 pip install openai
-'''
+```
 
 ### Optional Dependencies
 
-'''bash
+```bash
 pip install lmstudio pillow
-'''
+```
 
 ### Install from Source
 
-'''bash
+```bash
 git clone https://github.com/flgaertig/better-llm-sdk.git
 cd better-llm-sdk
-'''
+```
 
 ---
 
@@ -49,7 +49,7 @@ cd better-llm-sdk
 
 ### Basic Usage
 
-'''python
+```python
 from llm import LLM
 
 llm = LLM(
@@ -64,19 +64,19 @@ messages = [
 
 response = llm.response(messages)
 print(response["answer"])
-'''
+```
 
 ### Streaming Response
 
-'''python
+```python
 for event in llm.stream_response(messages):
     if event["type"] == "answer":
         print(event["content"], end="", flush=True)
-'''
+```
 
 ### Async Usage
 
-'''python
+```python
 import asyncio
 
 async def main():
@@ -87,7 +87,7 @@ async def main():
     print(response["answer"])
 
 asyncio.run(main())
-'''
+```
 
 ---
 
@@ -95,7 +95,7 @@ asyncio.run(main())
 
 ### Initialization
 
-'''python
+```python
 LLM(
     model: str,
     api_key: str = "lm-studio",
@@ -106,7 +106,7 @@ LLM(
     extra_body: Optional[Dict[str, Any]] = None,
     tool_exec: bool = True,
 )
-'''
+```
 
 **Parameters:**
 
@@ -123,14 +123,14 @@ LLM(
 
 ### Context Manager
 
-'''python
+```python
 with LLM(model="qwen2.5-coder-7b") as llm:
     response = llm.response(messages)
 
 # Async
 async with LLM(model="qwen2.5-coder-7b") as llm:
     response = await llm.async_response(messages)
-'''
+```
 
 ---
 
@@ -140,7 +140,7 @@ async with LLM(model="qwen2.5-coder-7b") as llm:
 
 Non-streaming synchronous inference.
 
-'''python
+```python
 response = llm.response(
     messages: List[Dict[str, Any]],
     output_format: Union[Dict, type, None] = None,
@@ -154,7 +154,7 @@ response = llm.response(
     extra_body: Optional[Dict] = None,
     tool_exec: Optional[bool] = None,
 ) -> FinalResponse
-'''
+```
 
 **Parameters:**
 
@@ -174,7 +174,7 @@ response = llm.response(
 
 **Returns:**
 
-'''python
+```python
 {
     "answer": "Response text or structured data",
     "reasoning": "Thinking process (if hide_thinking=False)",
@@ -186,7 +186,7 @@ response = llm.response(
         "latency": 0.12
     }
 }
-'''
+```
 
 ---
 
@@ -194,7 +194,7 @@ response = llm.response(
 
 Streaming synchronous inference.
 
-'''python
+```python
 for event in llm.stream_response(
     messages: List[Dict],
     output_format: Union[Dict, type, None] = None,
@@ -210,7 +210,7 @@ for event in llm.stream_response(
     tool_exec: Optional[bool] = None,
 ):
     pass
-'''
+```
 
 The generator supports `send()` for providing decisions on review requests (see [Tool Interceptors](#tool-interceptors)).
 
@@ -220,14 +220,14 @@ The generator supports `send()` for providing decisions on review requests (see 
 
 Asynchronous versions with identical parameter signatures.
 
-'''python
+```python
 # Async non-streaming
 response = await llm.async_response(messages)
 
 # Async streaming
 async for event in llm.async_stream_response(messages):
     print(event)
-'''
+```
 
 The async stream supports `asend()` for review decisions.
 
@@ -237,7 +237,7 @@ The async stream supports `asend()` for review decisions.
 
 All events follow the `StreamEvent` format:
 
-'''python
+```python
 {
     "type": str,              # Event type
     "content": Any,           # Event payload
@@ -246,7 +246,7 @@ All events follow the `StreamEvent` format:
     "job": Optional[int],     # Tool job number (if applicable)
     "depth": int              # Nesting depth (0 = top level)
 }
-'''
+```
 
 | Type | Description | Content |
 |------|-------------|---------|
@@ -267,7 +267,7 @@ All events follow the `StreamEvent` format:
 
 Define tools as Python functions with type hints:
 
-'''python
+```python
 def get_weather(city: str, unit: str = "celsius") -> dict:
     """Get the current weather for a city.
 
@@ -281,11 +281,11 @@ messages = [{"role": "user", "content": "What's the weather in Paris?"}]
 
 response = llm.response(messages=messages, tools=[get_weather])
 print(response["tool_results"])
-'''
+```
 
 You can also use OpenAI standard schema format (dict):
 
-'''python
+```python
 search_tool_schema = {
     "type": "function",
     "function": {
@@ -304,7 +304,7 @@ search_tool_schema = {
 
 # Mix both formats
 response = llm.response(messages=messages, tools=[get_weather, search_tool_schema])
-'''
+```
 
 **Tool Flow:**
 1. **Callable functions** are auto-converted to OpenAI tool schema via introspection
@@ -320,14 +320,14 @@ response = llm.response(messages=messages, tools=[get_weather, search_tool_schem
 
 Set `tool_exec=False` to receive tool calls without executing them:
 
-'''python
+```python
 # Instance-level
 llm = LLM(model="qwen2.5-coder-7b", tool_exec=False)
 
 # Or per-request override
 response = llm.response(messages, tools=[get_weather], tool_exec=False)
 # response["tool_calls"] contains the calls, no execution
-'''
+```
 
 ---
 
@@ -335,7 +335,7 @@ response = llm.response(messages, tools=[get_weather], tool_exec=False)
 
 Tool interceptors enable human-in-the-loop approval before tool execution:
 
-'''python
+```python
 from llm import LLM, tool_interceptor
 
 # Create interceptor for specific tools
@@ -343,11 +343,11 @@ interceptor = tool_interceptor("get_weather", "delete_file")
 
 # Or pass callables directly
 interceptor = tool_interceptor(get_weather, delete_file)
-'''
+```
 
 When using streaming, the generator yields a `review_request` event and waits for a decision via `send()`:
 
-'''python
+```python
 gen = llm.stream_response(
     messages=messages,
     tools=[get_weather],
@@ -361,24 +361,24 @@ for event in gen:
         event = gen.send(user_decision)  # "approve" to proceed
     elif event["type"] == "answer":
         print(event["content"], end="")
-'''
+```
 
 You can also write a custom interceptor function:
 
-'''python
+```python
 def my_interceptor(tool_name: str, arguments: dict) -> bool:
     """Return True if tool needs review, False to auto-approve."""
     return tool_name == "dangerous_tool"
 
 response = llm.response(messages, tools=tools, tool_interceptor=my_interceptor)
-'''
+```
 
 Async interceptors are also supported:
 
-'''python
+```python
 async def async_interceptor(tool_name: str, arguments: dict) -> bool:
     return tool_name in {"delete_file", "send_email"}
-'''
+```
 
 ---
 
@@ -386,34 +386,34 @@ async def async_interceptor(tool_name: str, arguments: dict) -> bool:
 
 Tools can be **generators** (sync or async) to stream intermediate output:
 
-'''python
+```python
 def streaming_search(query: str):
     """Search that streams results as they arrive."""
     for i in range(3):
         yield {"type": "answer", "content": f"Result {i+1} for '{query}'"}
     # The return value becomes the tool result
     return f"Found 3 results for '{query}'"
-'''
+```
 
 Generator chunks are wrapped in `tool_stream` events with incrementing `depth`:
 
-'''python
+```python
 for event in llm.stream_response(messages, tools=[streaming_search]):
     if event["type"] == "tool_stream":
         print(f"[depth={event['depth']}] {event['content']}")
     elif event["type"] == "tool_result":
         print(f"Final: {event['content']['result']}")
-'''
+```
 
 Async generators work the same way:
 
-'''python
+```python
 async def async_streaming_tool(query: str):
     """Async generator tool."""
     for i in range(3):
         yield {"type": "answer", "content": f"Result {i+1}"}
     return "Done"
-'''
+```
 
 Generator tools can also yield `review_request` events for nested human-in-the-loop workflows. The `depth` field tracks nesting level.
 
@@ -423,7 +423,7 @@ Generator tools can also yield `review_request` events for nested human-in-the-l
 
 Define your output schema as a plain Python class:
 
-'''python
+```python
 from typing import List, Optional, Literal
 from llm import LLM
 
@@ -443,7 +443,7 @@ messages = [
 response = llm.response(messages, output_format=PersonInfo)
 print(response["answer"])
 # {"name": "Alice", "age": 28, "hobbies": ["coding", "reading"], "email": null, "status": "active"}
-'''
+```
 
 **Supported types:**
 - ✅ Basic types: `str`, `int`, `float`, `bool`
@@ -456,7 +456,7 @@ print(response["answer"])
 
 **Dict schema passthrough still works:**
 
-'''python
+```python
 schema = {
     "type": "json_schema",
     "json_schema": {
@@ -473,7 +473,7 @@ schema = {
     }
 }
 response = llm.response(messages, output_format=schema)
-'''
+```
 
 ---
 
@@ -483,7 +483,7 @@ Images can be provided in four formats. All are automatically converted to base6
 
 #### From File Path
 
-'''python
+```python
 messages = [
     {
         "role": "user",
@@ -495,11 +495,11 @@ messages = [
 ]
 
 response = llm.response(messages)
-'''
+```
 
 #### From PIL Image
 
-'''python
+```python
 from PIL import Image
 
 img = Image.open("photo.jpg")
@@ -513,11 +513,11 @@ messages = [
         ]
     }
 ]
-'''
+```
 
 #### From URL
 
-'''python
+```python
 messages = [
     {
         "role": "user",
@@ -527,17 +527,17 @@ messages = [
         ]
     }
 ]
-'''
+```
 
 The URL value can also be a dict for additional options:
 
-'''python
+```python
 {"type": "image", "image_url": {"url": "https://example.com/image.jpg"}}
-'''
+```
 
 #### From Base64
 
-'''python
+```python
 messages = [
     {
         "role": "user",
@@ -547,7 +547,7 @@ messages = [
         ]
     }
 ]
-'''
+```
 
 ---
 
@@ -559,18 +559,18 @@ Models can output reasoning tokens that are parsed and separated. Built-in suppo
 - `<thinking>...</thinking>`
 - `[THINK]...[/THINK]`
 
-'''python
+```python
 response = llm.response(messages, hide_thinking=False)
 
 print(response["reasoning"])  # "Let me analyze this..."
 print(response["answer"])      # "The answer is 42."
-'''
+```
 
 #### Custom Thinking Tokens
 
 For models with non-standard thinking patterns:
 
-'''python
+```python
 from llm import LLM, CustomThinkingToken
 
 # Custom delimiters
@@ -591,7 +591,7 @@ llm = LLM(
         end_token="<<END>>"
     )
 )
-'''
+```
 
 **`CustomThinkingToken` parameters:**
 
@@ -609,21 +609,21 @@ Both `start_token` and `end_token` must be provided together.
 
 Get token counts, throughput, and latency:
 
-'''python
+```python
 response = llm.response(messages, verbose=True)
 
 print(response["verbose"])
 # {"tokens": 150, "tokens_per_second": 42.3, "latency": 0.12}
-'''
+```
 
 In streaming mode, a `verbose` event is emitted:
 
-'''python
+```python
 for event in llm.stream_response(messages, verbose=True):
     if event["type"] == "verbose":
         info = event["content"]
         print(f"Tokens: {info['tokens']}, Speed: {info['tokens_per_second']:.1f} t/s")
-'''
+```
 
 ---
 
@@ -631,7 +631,7 @@ for event in llm.stream_response(messages, verbose=True):
 
 Pass additional parameters to the API request:
 
-'''python
+```python
 # Instance-level (applies to all requests)
 llm = LLM(
     model="qwen2.5-coder-7b",
@@ -645,13 +645,13 @@ response = llm.response(
     reasoning_effort="high",
     max_tokens=1024
 )
-'''
+```
 
 ---
 
 ### LM Studio Integration
 
-'''python
+```python
 llm = LLM(
     model="local-model",
     base_url="http://localhost:1234/v1"
@@ -670,7 +670,7 @@ response = llm.response(
     messages=messages,
     lm_studio_unload_model=True
 )
-'''
+```
 
 ---
 
@@ -687,7 +687,7 @@ The SDK defines a structured exception hierarchy:
 | `ModelRequestError` | API request failure |
 | `LLMTimeoutError` | Operation timed out |
 
-'''python
+```python
 from llm import LLM, ModelRequestError, ConfigurationError, LLMTimeoutError
 
 try:
@@ -698,7 +698,7 @@ except ConfigurationError as e:
     print(f"Config error: {e}")
 except LLMTimeoutError as e:
     print(f"Timeout: {e}")
-'''
+```
 
 ---
 
@@ -706,7 +706,7 @@ except LLMTimeoutError as e:
 
 ### Complete Chatbot
 
-'''python
+```python
 from llm import LLM
 
 def chat():
@@ -737,11 +737,11 @@ def chat():
 
 if __name__ == "__main__":
     chat()
-'''
+```
 
 ### Async Batch Processing
 
-'''python
+```python
 import asyncio
 from llm import LLM
 
@@ -763,11 +763,11 @@ prompts = [
 results = asyncio.run(process_batch(prompts))
 for prompt, result in zip(prompts, results):
     print(f"Q: {prompt}\nA: {result}\n")
-'''
+```
 
 ### Agent with Tools and Interceptor
 
-'''python
+```python
 from llm import LLM, tool_interceptor
 import datetime
 
@@ -803,11 +803,11 @@ response = llm.response(
 print("Answer:", response["answer"])
 for result in response.get("tool_results", []):
     print(f"  {result['name']}: {result['result']}")
-'''
+```
 
 ### Generator Tool with Streaming Output
 
-'''python
+```python
 from llm import LLM
 
 def search_database(query: str):
@@ -827,13 +827,13 @@ for event in llm.stream_response(messages, tools=[search_database]):
         print(f"  [streaming] {event['content']}")
     elif event["type"] == "tool_result":
         print(f"  [final] {event['content']['result']}")
-'''
+```
 
 ---
 
 ## 📝 Public API
 
-'''python
+```python
 from llm import (
     # Main class
     LLM,
@@ -864,18 +864,18 @@ from llm import (
     # Factory
     tool_interceptor,    # Create interceptor from tool names/callables
 )
-'''
+```
 
 ### Message Format
 
-'''python
+```python
 messages = [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Hello!"},
     {"role": "assistant", "content": "Hi! How can I help?"},
     {"role": "user", "content": "What's the weather?"}
 ]
-'''
+```
 
 ---
 
