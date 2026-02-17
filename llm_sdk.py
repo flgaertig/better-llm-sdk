@@ -22,16 +22,12 @@ import threading
 import asyncio
 import inspect
 import logging
-from abc import ABC, abstractmethod
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from functools import cached_property, lru_cache
+from dataclasses import dataclass
+from enum import Enum
 from typing import (
     Any, AsyncGenerator, Dict, Optional, List, Generator,
     Callable, Union, get_type_hints, get_origin, get_args, 
-    Literal, Awaitable, TypedDict, Protocol, TypeVar, Generic,
-    Iterator, Mapping, Sequence, Final, ClassVar, overload,
+    Literal, Awaitable, TypedDict, TypeVar, Final, ClassVar,
     TYPE_CHECKING
 )
 
@@ -85,6 +81,7 @@ class EventType(str, Enum):
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     TOOL_ERROR = "tool_error"
+    TOOL_STREAM = "tool_stream"      # NEW: streaming output from tool
     REVIEW_REQUEST = "review_request"
     VERBOSE = "verbose"
     FINAL = "final"
@@ -115,10 +112,13 @@ T = TypeVar('T')
 
 
 class StreamEvent(TypedDict, total=False):
-    """Typed dictionary for stream events."""
+    """Unified event format for all stream events."""
     type: str
     content: Any
-    job: int
+    source: Optional[str]
+    tool_id: Optional[str]
+    job: Optional[int]
+    depth: int
 
 
 class ToolCall(TypedDict):
@@ -183,7 +183,7 @@ class ModelRequestError(LLMError):
     pass
 
 
-class TimeoutError(LLMError):
+class LLMTimeoutError(LLMError):
     """Raised when operation times out."""
     pass
 
@@ -219,18 +219,19 @@ class LLMConfig:
         model: Model identifier.
         api_key: API key for authentication.
         base_url: Base URL for API endpoint.
-        vllm_mode: Enable vLLM-specific optimizations.
         custom_thinking_token: Custom thinking token configuration.
         default_stop_sequences: Default stop sequences for generation.
         timeout: Default timeout for synchronous operations.
+        tool_exec: Whether to execute tools (True) or only stream tool calls (False).
     """
     model: str
     api_key: str = DEFAULT_API_KEY
     base_url: str = DEFAULT_BASE_URL
-    vllm_mode: bool = False
     custom_thinking_token: Optional[CustomThinkingToken] = None
     default_stop_sequences: Optional[List[str]] = None
     timeout: float = DEFAULT_TIMEOUT
+    extra_body: Optional[Dict[str, Any]] = None
+    tool_exec: bool = True
 
 # ============================================================================
 # Thinking Parser
@@ -247,10 +248,10 @@ class ThinkingParser:
     
     # Pre-compiled base patterns for performance
     _BASE_START_PATTERNS: ClassVar[tuple[str, ...]] = (
-        r'<think>', r'<thought>', r'<thinking>', r'\[THINK\]'
+        r'<think>', r'<thinking>', r'\[THINK\]'
     )
     _BASE_END_PATTERNS: ClassVar[tuple[str, ...]] = (
-        r'</think>', r'</thought>', r'</thinking>', r'\[/THINK\]'
+        r'</think>', r'</thinking>', r'\[/THINK\]'
     )
     
     def __init__(self, custom_token: Optional[CustomThinkingToken] = None):
@@ -696,25 +697,23 @@ class ToolPreparator:
 class ImageProcessor:
     """Processes images in messages for API consumption."""
     
+    # 1. Create a cache variable (starts empty)
+    _pil_image = None
+    
+    @classmethod
+    def _get_pil(cls):
+        """Helper to import PIL only once."""
+        if cls._pil_image is None:
+            try:
+                from PIL import Image
+                cls._pil_image = Image
+            except ImportError:
+                raise ImportError("PIL/Pillow required. Install with: pip install Pillow")
+        return cls._pil_image
+
     @staticmethod
     def process_messages(messages: List[Dict]) -> None:
-        """Convert custom image formats to OpenAI-compatible format.
-        
-        Modifies messages in-place.
-        
-        Supported formats:
-        - image_path: Path to image file
-        - image_pil: PIL Image object
-        - image_url: URL string or dict with url key
-        - image_base64: Base64 encoded image data
-        
-        Args:
-            messages: Messages to process.
-            
-        Raises:
-            ImportError: If PIL is required but not available.
-            ValueError: If image processing fails.
-        """
+        """Run this every time. It's safe."""
         for msg in messages:
             content = msg.get("content")
             if not isinstance(content, list):
@@ -728,7 +727,6 @@ class ImageProcessor:
     
     @staticmethod
     def _convert_image_item(item: Dict) -> Dict:
-        """Convert a single image item to API format."""
         if "image_path" in item:
             return ImageProcessor._from_path(item["image_path"])
         if "image_pil" in item:
@@ -741,11 +739,8 @@ class ImageProcessor:
     
     @staticmethod
     def _from_path(path: str) -> Dict:
-        """Convert image path to API format."""
-        try:
-            from PIL import Image
-        except ImportError:
-            raise ImportError("PIL/Pillow required for image_path processing")
+        # 2. Use the helper instead of importing directly
+        Image = ImageProcessor._get_pil()
         
         try:
             with Image.open(path) as img:
@@ -755,22 +750,16 @@ class ImageProcessor:
     
     @staticmethod
     def _from_pil(img: "PILImage") -> Dict:
-        """Convert PIL image to API format."""
-        try:
-            return ImageProcessor._encode_pil_image(img)
-        except Exception as e:
-            raise ValueError(f"Failed to process PIL image: {e}")
+        return ImageProcessor._encode_pil_image(img)
     
     @staticmethod
     def _from_url(url_data: Union[str, Dict]) -> Dict:
-        """Convert URL to API format."""
         if isinstance(url_data, str):
             url_data = {"url": url_data}
         return {"type": "image_url", "image_url": url_data}
     
     @staticmethod
     def _from_base64(data: str) -> Dict:
-        """Convert base64 data to API format."""
         return {
             "type": "image_url",
             "image_url": {"url": f"data:image/png;base64,{data}"}
@@ -778,7 +767,6 @@ class ImageProcessor:
     
     @staticmethod
     def _encode_pil_image(img: "PILImage") -> Dict:
-        """Encode PIL image to base64 API format."""
         buffer = io.BytesIO()
         img.save(buffer, format="PNG")
         buffer.seek(0)
@@ -838,7 +826,7 @@ class AsyncRunner:
         try:
             status, payload = result_queue.get(timeout=timeout)
         except queue.Empty:
-            raise TimeoutError(
+            raise LLMTimeoutError(
                 f"Coroutine execution timed out after {timeout}s. "
                 "Consider using async methods."
             )
@@ -856,55 +844,108 @@ class AsyncRunner:
 # ============================================================================
 
 class EventBuilder:
-    """Builds standardized stream events."""
+    """Builds standardized stream events with unified format."""
     
     @staticmethod
-    def answer(content: Any) -> StreamEvent:
-        return {"type": EventType.ANSWER.value, "content": content}
-    
-    @staticmethod
-    def reasoning(content: str) -> StreamEvent:
-        return {"type": EventType.REASONING.value, "content": content}
-    
-    @staticmethod
-    def tool_call(content: ToolCall, job: Optional[int] = None) -> StreamEvent:
-        event: StreamEvent = {"type": EventType.TOOL_CALL.value, "content": content}
+    def _build(
+        event_type: EventType,
+        content: Any,
+        source: Optional[str] = None,
+        tool_id: Optional[str] = None,
+        job: Optional[int] = None,
+        depth: int = 0  # NEW
+    ) -> StreamEvent:
+        """Build event with all metadata."""
+        event: StreamEvent = {
+            "type": event_type.value,
+            "content": content,
+            "source": source,
+            "depth": depth,
+        }
+        if tool_id is not None:
+            event["tool_id"] = tool_id
         if job is not None:
             event["job"] = job
         return event
     
     @staticmethod
-    def tool_result(content: ToolResult, job: Optional[int] = None) -> StreamEvent:
-        event: StreamEvent = {"type": EventType.TOOL_RESULT.value, "content": content}
-        if job is not None:
-            event["job"] = job
-        return event
+    def answer(
+        content: Any,
+        source: Optional[str] = None,
+        tool_id: Optional[str] = None,
+        job: Optional[int] = None,
+        depth: int = 0
+    ) -> StreamEvent:
+        return EventBuilder._build(EventType.ANSWER, content, source, tool_id, job, depth)
     
     @staticmethod
-    def tool_error(content: Dict, job: Optional[int] = None) -> StreamEvent:
-        event: StreamEvent = {"type": EventType.TOOL_ERROR.value, "content": content}
-        if job is not None:
-            event["job"] = job
-        return event
+    def reasoning(
+        content: str,
+        source: Optional[str] = None,
+        tool_id: Optional[str] = None,
+        job: Optional[int] = None,
+        depth: int = 0
+    ) -> StreamEvent:
+        return EventBuilder._build(EventType.REASONING, content, source, tool_id, job, depth)
     
     @staticmethod
-    def review_request(content: ToolCall, job: Optional[int] = None) -> StreamEvent:
-        event: StreamEvent = {"type": EventType.REVIEW_REQUEST.value, "content": content}
-        if job is not None:
-            event["job"] = job
-        return event
+    def tool_call(
+        content: ToolCall,
+        source: Optional[str] = None,
+        job: Optional[int] = None,
+        depth: int = 0
+    ) -> StreamEvent:
+        return EventBuilder._build(EventType.TOOL_CALL, content, source, content.get("id"), job, depth)
     
     @staticmethod
-    def verbose(content: VerboseInfo) -> StreamEvent:
-        return {"type": EventType.VERBOSE.value, "content": content}
+    def tool_result(
+        content: ToolResult,
+        source: Optional[str] = None,
+        job: Optional[int] = None,
+        depth: int = 0
+    ) -> StreamEvent:
+        return EventBuilder._build(EventType.TOOL_RESULT, content, source, content.get("id"), job, depth)
     
     @staticmethod
-    def final(content: FinalResponse) -> StreamEvent:
-        return {"type": EventType.FINAL.value, "content": content}
+    def tool_error(
+        content: Dict,
+        source: Optional[str] = None,
+        job: Optional[int] = None,
+        depth: int = 0
+    ) -> StreamEvent:
+        return EventBuilder._build(EventType.TOOL_ERROR, content, source, content.get("id"), job, depth)
     
     @staticmethod
-    def done() -> StreamEvent:
-        return {"type": EventType.DONE.value, "content": None}
+    def tool_stream(
+        content: Any,
+        source: str,
+        tool_id: str,
+        job: Optional[int] = None,
+        depth: int = 1
+    ) -> StreamEvent:
+        """NEW: Wrap streaming tool output."""
+        return EventBuilder._build(EventType.TOOL_STREAM, content, source, tool_id, job, depth)
+    
+    @staticmethod
+    def review_request(
+        content: ToolCall,
+        source: Optional[str] = None,
+        job: Optional[int] = None,
+        depth: int = 0
+    ) -> StreamEvent:
+        return EventBuilder._build(EventType.REVIEW_REQUEST, content, source, content.get("id"), job, depth)
+    
+    @staticmethod
+    def verbose(content: VerboseInfo, depth: int = 0) -> StreamEvent:
+        return EventBuilder._build(EventType.VERBOSE, content, None, None, None, depth)
+    
+    @staticmethod
+    def final(content: FinalResponse, depth: int = 0) -> StreamEvent:
+        return EventBuilder._build(EventType.FINAL, content, None, None, None, depth)
+    
+    @staticmethod
+    def done(depth: int = 0) -> StreamEvent:
+        return EventBuilder._build(EventType.DONE, None, None, None, None, depth)
 
 # ============================================================================
 # Tool Call Accumulator
@@ -984,32 +1025,34 @@ class LLM:
     def __init__(
         self, 
         model: str, 
-        vllm_mode: bool = False, 
         api_key: str = DEFAULT_API_KEY,
         base_url: str = DEFAULT_BASE_URL,
         custom_thinking_token: Optional[CustomThinkingToken] = None,
         default_stop_sequences: Optional[List[str]] = None,
-        timeout: float = DEFAULT_TIMEOUT
+        timeout: float = DEFAULT_TIMEOUT,
+        extra_body: Optional[Dict[str, Any]] = None,
+        tool_exec: bool = True,
     ):
         """Initialize the LLM wrapper.
         
         Args:
             model: Model identifier to use.
-            vllm_mode: Enable vLLM-specific optimizations.
             api_key: API key for authentication.
             base_url: Base URL for API endpoint.
             custom_thinking_token: Custom thinking token configuration.
             default_stop_sequences: Default stop sequences for generation.
             timeout: Default timeout for sync operations.
+            tool_exec: Whether to execute tools (True) or only stream tool calls (False).
         """
         self._config = LLMConfig(
             model=model,
             api_key=api_key,
             base_url=base_url.rstrip("/"),
-            vllm_mode=vllm_mode,
             custom_thinking_token=custom_thinking_token,
             default_stop_sequences=default_stop_sequences,
-            timeout=timeout
+            timeout=timeout,
+            extra_body=extra_body,
+            tool_exec=tool_exec,
         )
         
         # Compute API base URL
@@ -1024,7 +1067,7 @@ class LLM:
         self._tool_preparator = ToolPreparator(self._schema_converter)
         self._event_builder = EventBuilder()
         
-        logger.debug(f"LLM initialized: model={model}, base_url={self._api_base}")
+        logger.debug(f"LLM initialized: model={model}, base_url={self._api_base.split('@')[-1]}")
     
     def _compute_api_base(self) -> str:
         """Compute the API base URL."""
@@ -1042,11 +1085,6 @@ class LLM:
     def base_url(self) -> str:
         """Base URL for API."""
         return self._config.base_url
-    
-    @property
-    def vllm_mode(self) -> bool:
-        """Whether vLLM mode is enabled."""
-        return self._config.vllm_mode
     
     # ========================================================================
     # Output Format Handling
@@ -1164,7 +1202,9 @@ class LLM:
         hide_thinking: bool = True,
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
-        tool_interceptor: Optional[ToolInterceptor] = None
+        tool_interceptor: Optional[ToolInterceptor] = None,
+        extra_body: Optional[Dict] = None,
+        tool_exec: Optional[bool] = None,
     ) -> FinalResponse:
         """Request model inference (non-streaming).
         
@@ -1178,6 +1218,8 @@ class LLM:
             reasoning_effort: Reasoning effort level (model-specific).
             max_tokens: Maximum tokens to generate.
             tool_interceptor: Callback for tool review.
+            extra_body: Extra body for the request.
+            tool_exec: Override tool execution (None uses config default).
             
         Returns:
             Final response with answer and optional tool results.
@@ -1204,7 +1246,9 @@ class LLM:
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
             verbose=verbose,
-            tool_interceptor=tool_interceptor
+            tool_interceptor=tool_interceptor,
+            extra_body=extra_body or self._config.extra_body,
+            tool_exec=tool_exec,
         ):
             if event["type"] == EventType.ANSWER.value:
                 content = event["content"]
@@ -1230,7 +1274,9 @@ class LLM:
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         verbose: bool = False,
-        tool_interceptor: Optional[ToolInterceptor] = None
+        tool_interceptor: Optional[ToolInterceptor] = None,
+        extra_body: Optional[Dict] = None,
+        tool_exec: Optional[bool] = None,
     ) -> Generator[StreamEvent, Optional[str], None]:
         """Request model inference with streaming.
         
@@ -1245,6 +1291,8 @@ class LLM:
             max_tokens: Maximum tokens to generate.
             verbose: Include timing information.
             tool_interceptor: Callback for tool review.
+            extra_body: Extra body for the request.
+            tool_exec: Override tool execution (None uses config default).
             
         Yields:
             Stream events with type and content.
@@ -1256,6 +1304,9 @@ class LLM:
         output_format = self._prepare_output_format(output_format)
         prepared_tools = self._tool_preparator.prepare(tools)
         ImageProcessor.process_messages(messages)
+        
+        # Determine effective tool_exec value
+        effective_tool_exec = tool_exec if tool_exec is not None else self._config.tool_exec
         
         if lm_studio_unload_model:
             self._unload_other_models()
@@ -1281,6 +1332,10 @@ class LLM:
         }
         if prepared_tools.definitions:
             kwargs["tools"] = prepared_tools.definitions
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        elif self._config.extra_body:
+            kwargs["extra_body"] = self._config.extra_body
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
         if max_tokens:
@@ -1348,27 +1403,40 @@ class LLM:
         # Execute tools
         final_tool_calls = tool_accumulator.get_completed_calls()
         executed_results: List[ToolResult] = []
-        
-        for tool_call in final_tool_calls:
-            yield self._event_builder.tool_call(tool_call)
-            
+
+        for idx, tool_call in enumerate(final_tool_calls):
+            job = idx + 1
             tool_name = tool_call["name"]
+            tool_id = tool_call["id"]
+            
+            yield self._event_builder.tool_call(tool_call, source=tool_name, job=job)
+            
+            # Skip execution if disabled
+            if not effective_tool_exec:
+                continue
+            
             if tool_name not in prepared_tools.callables:
                 continue
             
             try:
-                # Check interceptor
                 if tool_interceptor:
                     needs_review = tool_interceptor(tool_name, tool_call["arguments"])
                     if asyncio.iscoroutine(needs_review):
                         needs_review = AsyncRunner.run_sync(needs_review)
                     
                     if needs_review:
-                        decision = yield self._event_builder.review_request(tool_call)
+                        decision = yield self._event_builder.review_request(
+                            tool_call, source=tool_name, job=job
+                        )
                         if decision != "approve":
-                            error = {"name": tool_name, "error": f"Rejected: {decision}", "id": tool_call["id"]}
-                            executed_results.append({"name": tool_name, "result": f"REJECTED: {decision}", "id": tool_call["id"], "is_error": True})
-                            yield self._event_builder.tool_error(error)
+                            error = {"name": tool_name, "error": f"Rejected: {decision}", "id": tool_id}
+                            executed_results.append({
+                                "name": tool_name, 
+                                "result": f"REJECTED: {decision}", 
+                                "id": tool_id, 
+                                "is_error": True
+                            })
+                            yield self._event_builder.tool_error(error, source=tool_name, job=job)
                             continue
                 
                 # Execute tool
@@ -1381,16 +1449,23 @@ class LLM:
                 
                 # Handle generators
                 if inspect.isgenerator(result):
-                    result = yield from self._consume_generator_sync(result, tool_name, tool_call["id"])
+                    result = yield from self._consume_generator_sync(
+                        result, tool_name, tool_id, job
+                    )
                 
-                tool_result: ToolResult = {"name": tool_name, "result": result, "id": tool_call["id"]}
+                tool_result: ToolResult = {"name": tool_name, "result": result, "id": tool_id}
                 executed_results.append(tool_result)
-                yield self._event_builder.tool_result(tool_result)
+                yield self._event_builder.tool_result(tool_result, source=tool_name, job=job)
                 
             except Exception as e:
-                error = {"name": tool_name, "error": str(e), "id": tool_call["id"]}
-                executed_results.append({"name": tool_name, "result": f"ERROR: {e}", "id": tool_call["id"], "is_error": True})
-                yield self._event_builder.tool_error(error)
+                error = {"name": tool_name, "error": str(e), "id": tool_id}
+                executed_results.append({
+                    "name": tool_name, 
+                    "result": f"ERROR: {e}", 
+                    "id": tool_id, 
+                    "is_error": True
+                })
+                yield self._event_builder.tool_error(error, source=tool_name, job=job)
         
         # Verbose info
         verbose_info: VerboseInfo = {
@@ -1448,43 +1523,78 @@ class LLM:
         return result
     
     def _consume_generator_sync(
-        self, 
-        gen: Generator, 
+        self,
+        gen: Generator,
         tool_name: str,
-        tool_id: str
+        tool_id: str,
+        job: Optional[int] = None
     ) -> Generator[StreamEvent, Optional[str], Any]:
-        """Consume a generator tool and yield events."""
-        actual_result = None
+        """Consume a generator tool and yield TOOL_STREAM events."""
+        final_result = None
+        
+        def compute_depth(chunk: Any) -> int:
+            if isinstance(chunk, dict) and "depth" in chunk:
+                return chunk["depth"] + 1
+            return 1
+        
+        def wrap_chunk(chunk: Any) -> StreamEvent:
+            return self._event_builder.tool_stream(
+                content=chunk,
+                source=tool_name,
+                tool_id=tool_id,
+                job=job,
+                depth=compute_depth(chunk)
+            )
+        
+        def is_event_type(chunk: Any, event_type: EventType) -> bool:
+            return isinstance(chunk, dict) and chunk.get("type") == event_type.value
+        
+        def needs_send_handling(chunk: Any) -> bool:
+            """Check if chunk needs send() handling (direct or nested REVIEW_REQUEST)."""
+            if not isinstance(chunk, dict):
+                return False
+            chunk_type = chunk.get("type")
+            if chunk_type == EventType.REVIEW_REQUEST.value:
+                return True
+            # Recursively check nested TOOL_STREAM content
+            if chunk_type == EventType.TOOL_STREAM.value:
+                return needs_send_handling(chunk.get("content"))
+            return False
         
         try:
             chunk = next(gen)
             while True:
-                if isinstance(chunk, dict):
-                    if chunk.get("type") == EventType.FINAL.value:
-                        actual_result = chunk.get("content")
-                        try:
-                            chunk = next(gen)
-                        except StopIteration:
-                            break
-                        continue
-                    
-                    if chunk.get("type") == EventType.REVIEW_REQUEST.value:
-                        decision = yield chunk
-                        try:
-                            chunk = gen.send(decision)
-                        except StopIteration:
-                            break
-                        continue
+                # FINAL - capture result
+                if is_event_type(chunk, EventType.FINAL):
+                    final_result = chunk.get("content")
+                    yield wrap_chunk(chunk)
+                    try:
+                        chunk = next(gen)
+                    except StopIteration:
+                        break
+                    continue
                 
-                yield chunk
+                # REVIEW_REQUEST (direct or nested) - needs send() propagation
+                if needs_send_handling(chunk):
+                    wrapped = wrap_chunk(chunk)
+                    decision = yield wrapped
+                    try:
+                        chunk = gen.send(decision)
+                    except StopIteration:
+                        break
+                    continue
+                
+                # Normal chunk
+                yield wrap_chunk(chunk)
                 try:
                     chunk = next(gen)
                 except StopIteration:
                     break
+                    
         except StopIteration:
             pass
         
-        return actual_result
+        return final_result
     
     # ========================================================================
     # Asynchronous Methods
@@ -1500,7 +1610,9 @@ class LLM:
         hide_thinking: bool = True,
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
-        tool_interceptor: Optional[ToolInterceptor] = None
+        tool_interceptor: Optional[ToolInterceptor] = None,
+        extra_body: Optional[Dict] = None,
+        tool_exec: Optional[bool] = None,
     ) -> FinalResponse:
         """Async request for model inference.
         
@@ -1514,6 +1626,8 @@ class LLM:
             reasoning_effort: Reasoning effort level.
             max_tokens: Maximum tokens to generate.
             tool_interceptor: Callback for tool review.
+            extra_body: Extra body for the request.
+            tool_exec: Override tool execution (None uses config default).
             
         Returns:
             Final response dictionary.
@@ -1534,7 +1648,9 @@ class LLM:
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
             verbose=verbose,
-            tool_interceptor=tool_interceptor
+            tool_interceptor=tool_interceptor,
+            extra_body=extra_body or self._config.extra_body,
+            tool_exec=tool_exec,
         ):
             if event["type"] == EventType.FINAL.value:
                 final_content = event["content"]
@@ -1556,7 +1672,9 @@ class LLM:
         hide_thinking: bool = True,
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
-        tool_interceptor: Optional[ToolInterceptor] = None
+        tool_interceptor: Optional[ToolInterceptor] = None,
+        extra_body: Optional[Dict] = None,
+        tool_exec: Optional[bool] = None,
     ) -> AsyncGenerator[StreamEvent, Optional[str]]:
         """Async streaming model inference.
         
@@ -1571,6 +1689,8 @@ class LLM:
             reasoning_effort: Reasoning effort level.
             max_tokens: Maximum tokens to generate.
             tool_interceptor: Callback for tool review.
+            extra_body: Extra body for the request.
+            tool_exec: Override tool execution (None uses config default).
             
         Yields:
             Stream events with type and content.
@@ -1582,6 +1702,9 @@ class LLM:
         output_format = self._prepare_output_format(output_format)
         prepared_tools = self._tool_preparator.prepare(tools)
         ImageProcessor.process_messages(messages)
+        
+        # Determine effective tool_exec value
+        effective_tool_exec = tool_exec if tool_exec is not None else self._config.tool_exec
         
         if lm_studio_unload_model:
             self._unload_other_models()
@@ -1607,6 +1730,10 @@ class LLM:
         }
         if prepared_tools.definitions:
             kwargs["tools"] = prepared_tools.definitions
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        elif self._config.extra_body:
+            kwargs["extra_body"] = self._config.extra_body
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
         if max_tokens:
@@ -1683,7 +1810,11 @@ class LLM:
             job = idx + 1
             tool_name = tool_call["name"]
             
-            yield self._event_builder.tool_call(tool_call, job)
+            yield self._event_builder.tool_call(tool_call, source=tool_name, job=job)
+            
+            # Skip execution if disabled
+            if not effective_tool_exec:
+                continue
             
             if tool_name not in prepared_tools.callables:
                 continue
@@ -1696,11 +1827,11 @@ class LLM:
                     needs_review = tool_interceptor(tool_name, tool_call["arguments"])
                 
                 if needs_review:
-                    decision = yield self._event_builder.review_request(tool_call, job)
+                    decision = yield self._event_builder.review_request(tool_call, source=tool_name, job=job)
                     if decision != "approve":
                         error = {"name": tool_name, "error": f"Rejected: {decision}", "id": tool_call["id"]}
                         executed_results.append({"name": tool_name, "result": f"REJECTED: {decision}", "id": tool_call["id"], "is_error": True})
-                        yield self._event_builder.tool_error(error, job)
+                        yield self._event_builder.tool_error(error, source=tool_name, job=job)
                         continue
             
             approved_tools.append((tool_call, job))
@@ -1741,10 +1872,10 @@ class LLM:
                     yield payload
                 elif kind == "result":
                     executed_results.append(payload)
-                    yield self._event_builder.tool_result(payload, job)
+                    yield self._event_builder.tool_result(payload, source=payload["name"], job=job)
                 elif kind == "error":
                     executed_results.append({"name": payload["name"], "result": f"ERROR: {payload['error']}", "id": payload["id"], "is_error": True})
-                    yield self._event_builder.tool_error(payload, job)
+                    yield self._event_builder.tool_error(payload, source=payload["name"], job=job)
             
             await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -1816,35 +1947,63 @@ class LLM:
         event_queue: asyncio.Queue,
         job: int
     ) -> Any:
-        """Consume an async generator tool."""
-        actual_result = None
+        """Consume an async generator tool with TOOL_STREAM events."""
+        final_result = None
+        
+        def compute_depth(chunk: Any) -> int:
+            if isinstance(chunk, dict) and "depth" in chunk:
+                return chunk["depth"] + 1
+            return 1
+        
+        def wrap_chunk(chunk: Any) -> StreamEvent:
+            return self._event_builder.tool_stream(
+                content=chunk,
+                source=tool_name,
+                tool_id=tool_id,
+                job=job,
+                depth=compute_depth(chunk)
+            )
+        
+        def is_event_type(chunk: Any, event_type: EventType) -> bool:
+            return isinstance(chunk, dict) and chunk.get("type") == event_type.value
+
+        def needs_send_handling(chunk: Any) -> bool:
+            if not isinstance(chunk, dict):
+                return False
+            chunk_type = chunk.get("type")
+            if chunk_type == EventType.REVIEW_REQUEST.value:
+                return True
+            if chunk_type == EventType.TOOL_STREAM.value:
+                return needs_send_handling(chunk.get("content"))
+            return False
         
         try:
             chunk = await gen.__anext__()
             while True:
-                if isinstance(chunk, dict):
-                    if "job" not in chunk:
-                        chunk["job"] = job
-                    
-                    if chunk.get("type") == EventType.FINAL.value:
-                        actual_result = chunk.get("content")
-                        try:
-                            chunk = await gen.__anext__()
-                        except StopAsyncIteration:
-                            break
-                        continue
-                    
-                    if chunk.get("type") == EventType.REVIEW_REQUEST.value:
-                        future = asyncio.get_running_loop().create_future()
-                        await event_queue.put(("review", {"event": chunk, "future": future}, None))
-                        decision = await future
-                        try:
-                            chunk = await gen.asend(decision)
-                        except StopAsyncIteration:
-                            break
-                        continue
+                if is_event_type(chunk, EventType.FINAL):
+                    final_result = chunk.get("content")
+                    await event_queue.put(("event", wrap_chunk(chunk), job))
+                    try:
+                        chunk = await gen.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    continue
                 
-                await event_queue.put(("event", chunk, None))
+                # Handle direct or nested REVIEW_REQUEST
+                if needs_send_handling(chunk):
+                    future = asyncio.get_running_loop().create_future()
+                    await event_queue.put(("review", {
+                        "event": wrap_chunk(chunk),
+                        "future": future
+                    }, job))
+                    decision = await future
+                    try:
+                        chunk = await gen.asend(decision)
+                    except StopAsyncIteration:
+                        break
+                    continue
+                
+                await event_queue.put(("event", wrap_chunk(chunk), job))
                 try:
                     chunk = await gen.__anext__()
                 except StopAsyncIteration:
@@ -1852,7 +2011,7 @@ class LLM:
         except StopAsyncIteration:
             pass
         
-        return actual_result
+        return final_result
     
     async def _consume_sync_generator_async(
         self,
@@ -1863,35 +2022,62 @@ class LLM:
         job: int,
         loop: asyncio.AbstractEventLoop
     ) -> Any:
-        """Consume a sync generator in async context."""
-        actual_result = None
+        """Consume a sync generator in async context with TOOL_STREAM events."""
+        final_result = None
+        
+        def compute_depth(chunk: Any) -> int:
+            if isinstance(chunk, dict) and "depth" in chunk:
+                return chunk["depth"] + 1
+            return 1
+        
+        def wrap_chunk(chunk: Any) -> StreamEvent:
+            return self._event_builder.tool_stream(
+                content=chunk,
+                source=tool_name,
+                tool_id=tool_id,
+                job=job,
+                depth=compute_depth(chunk)
+            )
+        
+        def is_event_type(chunk: Any, event_type: EventType) -> bool:
+            return isinstance(chunk, dict) and chunk.get("type") == event_type.value
+        
+        def needs_send_handling(chunk: Any) -> bool:
+            if not isinstance(chunk, dict):
+                return False
+            chunk_type = chunk.get("type")
+            if chunk_type == EventType.REVIEW_REQUEST.value:
+                return True
+            if chunk_type == EventType.TOOL_STREAM.value:
+                return needs_send_handling(chunk.get("content"))
+            return False
         
         try:
             chunk = await loop.run_in_executor(None, next, gen)
             while True:
-                if isinstance(chunk, dict):
-                    if "job" not in chunk:
-                        chunk["job"] = job
-                    
-                    if chunk.get("type") == EventType.FINAL.value:
-                        actual_result = chunk.get("content")
-                        try:
-                            chunk = await loop.run_in_executor(None, next, gen)
-                        except StopIteration:
-                            break
-                        continue
-                    
-                    if chunk.get("type") == EventType.REVIEW_REQUEST.value:
-                        future = loop.create_future()
-                        await event_queue.put(("review", {"event": chunk, "future": future}, None))
-                        decision = await future
-                        try:
-                            chunk = await loop.run_in_executor(None, lambda: gen.send(decision))
-                        except StopIteration:
-                            break
-                        continue
+                if is_event_type(chunk, EventType.FINAL):
+                    final_result = chunk.get("content")
+                    await event_queue.put(("event", wrap_chunk(chunk), job))
+                    try:
+                        chunk = await loop.run_in_executor(None, next, gen)
+                    except StopIteration:
+                        break
+                    continue
                 
-                await event_queue.put(("event", chunk, None))
+                if needs_send_handling(chunk):
+                    future = loop.create_future()
+                    await event_queue.put(("review", {
+                        "event": wrap_chunk(chunk),
+                        "future": future
+                    }, job))
+                    decision = await future
+                    try:
+                        chunk = await loop.run_in_executor(None, lambda: gen.send(decision))
+                    except StopIteration:
+                        break
+                    continue
+                
+                await event_queue.put(("event", wrap_chunk(chunk), job))
                 try:
                     chunk = await loop.run_in_executor(None, next, gen)
                 except StopIteration:
@@ -1899,7 +2085,29 @@ class LLM:
         except StopIteration:
             pass
         
-        return actual_result
+        return final_result
+
+    # ============================================================================
+    # Context Manager
+    # ============================================================================
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self._client, 'close'):
+            self._client.close()
+        if hasattr(self._async_client, 'close'):
+            # Note: async close is tricky in __exit__
+            pass
+        return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self._async_client.close()
+        return False
 
 # ============================================================================
 # Tool Interceptor
@@ -1951,7 +2159,7 @@ __all__ = [
     "SchemaConversionError",
     "ToolExecutionError",
     "ModelRequestError",
-    "TimeoutError",
+    "LLMTimeoutError",
 
     # Tool Interceptor
     "tool_interceptor",
