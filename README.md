@@ -1,10 +1,10 @@
-# llm-sdk
+# 📦 llm-sdk
 
 Small Python SDK for OpenAI-compatible LLM APIs.
 
 One file, clean API, boring on purpose. Use it with local servers, OpenAI-style endpoints, structured output, tool calls, vision inputs, and reasoning streams.
 
-## Features
+## ✨ Features
 
 - Sync and async clients
 - Streaming and non-streaming responses
@@ -16,7 +16,7 @@ One file, clean API, boring on purpose. Use it with local servers, OpenAI-style 
 - Thinking/reasoning token parsing
 - Lightweight verbose stats for streams
 
-## Get Started
+## 🚀 Get Started
 
 Install the only required dependency:
 
@@ -50,7 +50,7 @@ print(response["answer"])
 
 By default, `base_url="http://localhost:1234/v1"` and `api_key="lm-studio"`, so local LM Studio-style servers work with very little setup.
 
-## Streaming
+## 📡 Streaming
 
 ```python
 for event in llm.stream_response([
@@ -73,7 +73,7 @@ Events are small dictionaries:
 
 Use `final=True` if you also want a final aggregated response event.
 
-## Async
+## ⏱️ Async
 
 ```python
 import asyncio
@@ -89,7 +89,7 @@ async def main():
 asyncio.run(main())
 ```
 
-## Structured Output
+## 📐 Structured Output
 
 Pass a JSON schema or a typed class. Classes are converted into OpenAI-compatible JSON schema.
 
@@ -107,7 +107,7 @@ result = llm.response(
 print(result["answer"])
 ```
 
-## Tools
+## 🛠️ Tools
 
 Pass Python callables or already-built OpenAI tool definitions. The SDK exposes tool definitions and returns streamed/final tool calls.
 
@@ -126,7 +126,7 @@ response = llm.response(
 print(response.get("tool_calls", []))
 ```
 
-## Vision
+## 👁️ Vision
 
 Image content can be a URL, a local path, base64, or a PIL image.
 
@@ -149,7 +149,7 @@ Supported image forms include:
 - `{"type": "image_base64", "image_base64": "..."}`
 - `{"type": "image_pil", "image_pil": image}`
 
-## Responses API
+## 🔌 Responses API
 
 Use `use_responses_api=True` for endpoints that prefer OpenAI's Responses API shape.
 
@@ -162,7 +162,7 @@ llm = LLM(
 )
 ```
 
-## Reasoning Effort
+## 🧠 Reasoning Effort
 
 Use `reasoning_effort="high"` to set models's reasoning effort.
 
@@ -173,7 +173,7 @@ response = llm.response(
 )
 ```
 
-## API
+## ⚙️ API
 
 - `response(...)` and `stream_response(...)`
 - `async_response(...)` and `async_stream_response(...)`
@@ -184,10 +184,10 @@ response = llm.response(
 - `verbose=True` for token-ish stream stats
 - `with LLM(...) as llm:` / `async with LLM(...) as llm:` for cleanup
 
-## Why
+## 💡 Why
 
 Most LLM wrappers either become frameworks or stay too close to raw HTTP. This sits in the middle: enough structure to be pleasant, little enough surface area to understand in one sitting.
 
-## License
+## 📜 License
 
 MIT
