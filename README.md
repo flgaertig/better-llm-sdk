@@ -66,7 +66,7 @@ Events are small dictionaries:
 {"type": "answer", "content": "..."}
 {"type": "reasoning", "content": "..."}
 {"type": "tool_call", "content": {"id": "...", "name": "...", "arguments": {...}}}
-{"type": "verbose", "content": {"tokens": 42, "tokens_per_second": 91.3, "latency": 0.2}}
+{"type": "verbose", "content": {"tokens": 42, "tokens_per_second": 91.3, "latency": 0.2, "prompt_tokens": 10, "completion_tokens": 32, "total_tokens": 42}}
 {"type": "final", "content": {"answer": "..."}}
 {"type": "done"}
 ```
