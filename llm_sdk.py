@@ -152,6 +152,9 @@ class VerboseInfo(TypedDict):
     tokens: int
     tokens_per_second: float
     latency: Optional[float]
+    prompt_tokens: Optional[int]
+    completion_tokens: Optional[int]
+    total_tokens: Optional[int]
 
 
 class FinalResponse(TypedDict, total=False):
@@ -944,6 +947,7 @@ class LLM:
             "model": self._config.model,
             "messages": request_messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if prepared_tools.definitions:
             kwargs["tools"] = prepared_tools.definitions
@@ -1054,6 +1058,16 @@ class LLM:
             })
         return converted
 
+    @staticmethod
+    def _read_usage(usage: Any) -> Dict[str, Optional[int]]:
+        if not usage:
+            return {}
+        return {
+            "prompt_tokens": getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        }
+
     def _build_responses_request(
         self,
         messages: List[Dict],
@@ -1134,6 +1148,7 @@ class LLM:
         thinking = ""
         answer = ""
         tokens = 0
+        api_usage: Dict[str, Optional[int]] = {}
         start_time = time.perf_counter()
         latency: Optional[float] = None
 
@@ -1154,6 +1169,9 @@ class LLM:
                     latency = time.perf_counter() - start_time
                 tokens += 1
                 etype = getattr(event, "type", "")
+                if etype == "response.completed":
+                    response = getattr(event, "response", None)
+                    api_usage = self._read_usage(getattr(response, "usage", None))
 
                 # ── Answer text ──────────────────────────────────────────
                 if etype == "response.output_text.delta":
@@ -1243,6 +1261,7 @@ class LLM:
             "tokens": tokens,
             "tokens_per_second": tps,
             "latency": latency,
+            **api_usage,
         }
         if verbose:
             yield self._event_builder.verbose(verbose_info)
@@ -1284,6 +1303,7 @@ class LLM:
         thinking = ""
         answer = ""
         tokens = 0
+        api_usage: Dict[str, Optional[int]] = {}
         start_time = time.perf_counter()
         latency: Optional[float] = None
 
@@ -1303,6 +1323,9 @@ class LLM:
                     latency = time.perf_counter() - start_time
                 tokens += 1
                 etype = getattr(event, "type", "")
+                if etype == "response.completed":
+                    response = getattr(event, "response", None)
+                    api_usage = self._read_usage(getattr(response, "usage", None))
 
                 if etype == "response.output_text.delta":
                     chunk = getattr(event, "delta", "") or ""
@@ -1386,6 +1409,7 @@ class LLM:
             "tokens": tokens,
             "tokens_per_second": tps,
             "latency": latency,
+            **api_usage,
         }
         if verbose:
             yield self._event_builder.verbose(verbose_info)
@@ -1495,12 +1519,33 @@ class LLM:
         try:
             completion = self._client.chat.completions.create(**kwargs)
         except Exception as e:
-            raise ModelRequestError(f"Model request failed: {e}")
+            if "stream_options" in kwargs:
+                kwargs_copy = dict(kwargs)
+                kwargs_copy.pop("stream_options", None)
+                try:
+                    completion = self._client.chat.completions.create(**kwargs_copy)
+                except Exception as inner_e:
+                    raise ModelRequestError(f"Model request failed: {inner_e}")
+            else:
+                raise ModelRequestError(f"Model request failed: {e}")
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
 
         try:
             for chunk in completion:
                 if latency is None:
                     latency = time.perf_counter() - start_time
+
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    if getattr(usage, "prompt_tokens", None) is not None:
+                        prompt_tokens = int(usage.prompt_tokens)
+                    if getattr(usage, "completion_tokens", None) is not None:
+                        completion_tokens = int(usage.completion_tokens)
+                    if getattr(usage, "total_tokens", None) is not None:
+                        total_tokens = int(usage.total_tokens)
 
                 if not chunk.choices:
                     continue
@@ -1536,6 +1581,8 @@ class LLM:
             raise ModelRequestError(f"Model stream failed: {e}") from e
 
         elapsed = time.perf_counter() - start_time
+        if completion_tokens > 0:
+            tokens = completion_tokens
         tokens_per_second = tokens / elapsed if elapsed > 0 else 0
 
         if structured_output:
@@ -1552,7 +1599,10 @@ class LLM:
         verbose_info: VerboseInfo = {
             "tokens": tokens,
             "tokens_per_second": tokens_per_second,
-            "latency": latency
+            "latency": latency,
+            "prompt_tokens": prompt_tokens if prompt_tokens > 0 else None,
+            "completion_tokens": completion_tokens if completion_tokens > 0 else None,
+            "total_tokens": total_tokens if total_tokens > 0 else None,
         }
 
         if verbose:
@@ -1666,12 +1716,34 @@ class LLM:
             create_call = self._async_client.chat.completions.create(**kwargs)
             completion = await create_call if asyncio.iscoroutine(create_call) else create_call
         except Exception as e:
-            raise ModelRequestError(f"Async model request failed: {e}")
+            if "stream_options" in kwargs:
+                kwargs_copy = dict(kwargs)
+                kwargs_copy.pop("stream_options", None)
+                try:
+                    create_call = self._async_client.chat.completions.create(**kwargs_copy)
+                    completion = await create_call if asyncio.iscoroutine(create_call) else create_call
+                except Exception as inner_e:
+                    raise ModelRequestError(f"Async model request failed: {inner_e}")
+            else:
+                raise ModelRequestError(f"Async model request failed: {e}")
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
 
         try:
             async for chunk in completion:
                 if latency is None:
                     latency = time.perf_counter() - start_time
+
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    if getattr(usage, "prompt_tokens", None) is not None:
+                        prompt_tokens = int(usage.prompt_tokens)
+                    if getattr(usage, "completion_tokens", None) is not None:
+                        completion_tokens = int(usage.completion_tokens)
+                    if getattr(usage, "total_tokens", None) is not None:
+                        total_tokens = int(usage.total_tokens)
 
                 if not chunk.choices:
                     continue
@@ -1707,6 +1779,8 @@ class LLM:
             raise ModelRequestError(f"Async model stream failed: {e}") from e
 
         elapsed = time.perf_counter() - start_time
+        if completion_tokens > 0:
+            tokens = completion_tokens
         tokens_per_second = tokens / elapsed if elapsed > 0 else 0
 
         if structured_output:
@@ -1723,7 +1797,10 @@ class LLM:
         verbose_info: VerboseInfo = {
             "tokens": tokens,
             "tokens_per_second": tokens_per_second,
-            "latency": latency
+            "latency": latency,
+            "prompt_tokens": prompt_tokens if prompt_tokens > 0 else None,
+            "completion_tokens": completion_tokens if completion_tokens > 0 else None,
+            "total_tokens": total_tokens if total_tokens > 0 else None,
         }
 
         if verbose:
