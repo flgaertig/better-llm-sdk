@@ -164,7 +164,7 @@ llm = LLM(
 
 ## Reasoning Effort
 
-Use `reasoning_effort="high"` to set models´s reasoning effort.
+Use `reasoning_effort="high"` to set models's reasoning effort.
 
 ```python
 response = llm.response(
