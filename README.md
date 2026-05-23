@@ -80,7 +80,7 @@ import asyncio
 from llm_sdk import LLM
 
 async def main():
-    async with LLM(model="gpt-4.1-mini", api_key="sk-...", base_url="https://api.openai.com/v1") as llm:
+    async with LLM(model="gpt-5.5", api_key="sk-...", base_url="https://api.openai.com/v1",use_responses_api=True) as llm:
         response = await llm.async_response([
             {"role": "user", "content": "Give me a crisp project name."}
         ])
@@ -155,10 +155,21 @@ Use `use_responses_api=True` for endpoints that prefer OpenAI's Responses API sh
 
 ```python
 llm = LLM(
-    model="gpt-4.1-mini",
+    model="gpt-5.5",
     api_key="sk-...",
     base_url="https://api.openai.com/v1",
     use_responses_api=True,
+)
+```
+
+## Reasoning Effort
+
+Use `reasoning_effort="high"` to set models´s reasoning effort.
+
+```python
+response = llm.response(
+    [{"role": "user", "content": "..."}],
+    reasoning_effort="high"
 )
 ```
 
