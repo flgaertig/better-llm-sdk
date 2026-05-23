@@ -36,7 +36,7 @@ Drop `llm_sdk.py` into your project or import it from this repo:
 from llm_sdk import LLM
 
 llm = LLM(
-    model="qwen2.5-coder-7b",
+    model="qwen3.6-27b",
     base_url="http://localhost:1234",
     api_key="lm-studio",
 )
