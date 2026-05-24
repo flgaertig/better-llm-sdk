@@ -18,19 +18,19 @@ One file, clean API, boring on purpose. Use it with local servers, OpenAI-style 
 
 ## 🚀 Get Started
 
-Install the only required dependency:
+Install the package directly from PyPI:
 
 ```bash
-pip install openai
+pip install llm-sdk-py
 ```
 
-Optional, only for PIL image inputs:
+If you also need PIL image support:
 
 ```bash
-pip install pillow
+pip install "llm-sdk-py[pillow]"
 ```
 
-Drop `llm_sdk.py` into your project or import it from this repo:
+Alternatively, since it's designed to be simple, you can still just drop `llm_sdk.py` directly into your project!
 
 ```python
 from llm_sdk import LLM
