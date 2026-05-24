@@ -21,6 +21,8 @@ import logging
 import copy
 import asyncio
 import threading
+import functools
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
@@ -68,13 +70,18 @@ DEFAULT_API_KEY: Final[str] = "lm-studio"
 DEFAULT_BASE_URL: Final[str] = "http://localhost:1234/v1"
 DEFAULT_TIMEOUT: Final[float] = 300.0
 
+MessageList = List[Dict[str, Any]]
+InputValue = Union[str, MessageList]
+
 
 def _close_async_resource(resource: Any) -> None:
     if not hasattr(resource, "close"):
         return
 
     async def _close() -> None:
-        await resource.close()
+        close_result = resource.close()
+        if inspect.isawaitable(close_result):
+            await close_result
 
     try:
         asyncio.get_running_loop()
@@ -95,6 +102,42 @@ def _close_async_resource(resource: Any) -> None:
     worker.join()
     if error_box:
         raise error_box[0]
+
+
+def _deep_merge_dicts(
+    base: Optional[Dict[str, Any]],
+    override: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not base and not override:
+        return None
+
+    merged = copy.deepcopy(base or {})
+    for key, value in (override or {}).items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, Mapping):
+            merged[key] = _deep_merge_dicts(current, dict(value))
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _resolve_messages(
+    messages: Optional[InputValue] = None,
+    input: Optional[InputValue] = None,
+) -> MessageList:
+    provided = [value is not None for value in (messages, input)].count(True)
+    if provided != 1:
+        raise ValueError("Provide exactly one of messages or input")
+
+    value = input if input is not None else messages
+    if isinstance(value, str):
+        return [{"role": "user", "content": value}]
+    if isinstance(value, list):
+        for idx, message in enumerate(value):
+            if not isinstance(message, dict):
+                raise ValueError(f"Message at index {idx} must be a dict")
+        return copy.deepcopy(value)
+    raise ValueError("input must be a string or a list of messages")
 
 # ============================================================================
 # Enums
@@ -522,12 +565,10 @@ class ToolPreparator:
 
     def _prepare_callable(self, func: Callable) -> Dict:
         """Prepare a callable for LLM consumption."""
-        underlying = func
-        while hasattr(underlying, 'func'):
-            underlying = underlying.func
+        underlying = self._unwrap_callable(func)
 
         name = (getattr(func, '__name__', None) or underlying.__name__).strip()
-        doc = (getattr(func, '__doc__', None) or underlying.__doc__ or "").strip()
+        doc = (getattr(underlying, '__doc__', None) or getattr(func, '__doc__', None) or "").strip()
 
         try:
             annotations = get_type_hints(underlying)
@@ -577,6 +618,13 @@ class ToolPreparator:
                 )
             }
         }
+
+    @staticmethod
+    def _unwrap_callable(func: Callable) -> Callable:
+        underlying = inspect.unwrap(func)
+        while isinstance(underlying, functools.partial):
+            underlying = inspect.unwrap(underlying.func)
+        return underlying
 
     @staticmethod
     def _format_default(value: Any) -> str:
@@ -889,10 +937,10 @@ class LLM:
         logger.debug(f"LLM initialized: model={model}, base_url={self._api_base}")
 
     def _compute_api_base(self) -> str:
-        base = self._config.base_url
-        if not base.endswith("/v1") and "openai" not in base.lower():
-            return base + "/v1"
-        return base
+        base = self._config.base_url.rstrip("/")
+        if re.search(r"/v\d+$", base):
+            return base
+        return f"{base}/v1"
 
     @property
     def model(self) -> str:
@@ -951,10 +999,9 @@ class LLM:
         }
         if prepared_tools.definitions:
             kwargs["tools"] = prepared_tools.definitions
-        if extra_body:
-            kwargs["extra_body"] = extra_body
-        elif self._config.extra_body:
-            kwargs["extra_body"] = self._config.extra_body
+        merged_extra_body = _deep_merge_dicts(self._config.extra_body, extra_body)
+        if merged_extra_body:
+            kwargs["extra_body"] = merged_extra_body
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
         if max_tokens is not None:
@@ -1047,7 +1094,6 @@ class LLM:
             parameters = copy.deepcopy(function.get("parameters") or {})
             properties = parameters.get("properties")
             if isinstance(properties, dict):
-                parameters["required"] = list(properties.keys())
                 parameters.setdefault("additionalProperties", False)
             converted.append({
                 "type": "function",
@@ -1062,11 +1108,173 @@ class LLM:
     def _read_usage(usage: Any) -> Dict[str, Optional[int]]:
         if not usage:
             return {}
+
+        def first_present(*names: str) -> Optional[int]:
+            for name in names:
+                value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+                if value is not None:
+                    return int(value)
+            return None
+
         return {
-            "prompt_tokens": getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None),
-            "total_tokens": getattr(usage, "total_tokens", None),
+            "prompt_tokens": first_present("input_tokens", "prompt_tokens"),
+            "completion_tokens": first_present("output_tokens", "completion_tokens"),
+            "total_tokens": first_present("total_tokens"),
         }
+
+    @staticmethod
+    def _new_responses_state() -> Dict[str, Any]:
+        return {
+            "thinking": "",
+            "answer": "",
+            "tokens": 0,
+            "api_usage": {},
+            "pending_tool_items": {},
+            "pending_tool_indexes": {},
+            "completed_tool_calls": [],
+        }
+
+    def _handle_responses_event(
+        self,
+        event: Any,
+        state: Dict[str, Any],
+        structured_output: bool,
+        hide_thinking: bool,
+    ) -> List[StreamEvent]:
+        state["tokens"] += 1
+        emitted: List[StreamEvent] = []
+        etype = getattr(event, "type", "")
+
+        if etype == "response.completed":
+            response = getattr(event, "response", None)
+            state["api_usage"] = self._read_usage(getattr(response, "usage", None))
+            return emitted
+
+        if etype == "response.output_text.delta":
+            chunk = getattr(event, "delta", "") or ""
+            if chunk:
+                state["answer"] += chunk
+                if not structured_output:
+                    emitted.append(self._event_builder.answer(chunk))
+            return emitted
+
+        if etype in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+            chunk = getattr(event, "delta", "") or ""
+            if chunk:
+                state["thinking"] += chunk
+                if not hide_thinking:
+                    emitted.append(self._event_builder.reasoning(chunk))
+            return emitted
+
+        if etype == "response.output_item.added":
+            item = getattr(event, "item", None)
+            if item and getattr(item, "type", "") == "function_call":
+                output_index = getattr(event, "output_index", None)
+                pending = {
+                    "call_id": getattr(item, "call_id", None) or getattr(item, "id", ""),
+                    "name": getattr(item, "name", "") or "",
+                }
+                state["pending_tool_items"][getattr(item, "id", "")] = pending
+                if output_index is not None:
+                    state["pending_tool_indexes"][int(output_index)] = pending
+            return emitted
+
+        if etype == "response.output_item.done":
+            item = getattr(event, "item", None)
+            if item and getattr(item, "type", "") == "function_call":
+                output_index = getattr(event, "output_index", None)
+                pending = state["pending_tool_items"].setdefault(getattr(item, "id", ""), {})
+                pending["call_id"] = (
+                    getattr(item, "call_id", None)
+                    or pending.get("call_id", "")
+                    or getattr(item, "id", "")
+                )
+                pending["name"] = getattr(item, "name", "") or pending.get("name", "")
+                if output_index is not None:
+                    state["pending_tool_indexes"][int(output_index)] = pending
+            return emitted
+
+        if etype == "response.function_call_arguments.done":
+            item_id = getattr(event, "item_id", None)
+            output_index = getattr(event, "output_index", None)
+            args_str = getattr(event, "arguments", "{}") or "{}"
+            fn_name = getattr(event, "name", "")
+
+            pending = state["pending_tool_items"].pop(item_id, {}) if item_id else {}
+            if not pending and output_index is not None:
+                pending = state["pending_tool_indexes"].get(int(output_index), {})
+
+            try:
+                args = json.loads(args_str)
+            except json.JSONDecodeError:
+                args = {"_raw": args_str}
+
+            state["completed_tool_calls"].append({
+                "id": pending.get("call_id", item_id or ""),
+                "name": fn_name or pending.get("name", ""),
+                "arguments": args,
+            })
+            return emitted
+
+        return emitted
+
+    def _finalize_responses_stream(
+        self,
+        state: Dict[str, Any],
+        structured_output: bool,
+        verbose: bool,
+        final: bool,
+        hide_thinking: bool,
+        latency: Optional[float],
+        elapsed: float,
+    ) -> Generator[StreamEvent, None, None]:
+        answer = state["answer"]
+        if structured_output:
+            try:
+                answer = json.loads(answer)
+            except json.JSONDecodeError:
+                pass
+            yield self._event_builder.answer(answer)
+
+        completed_tool_calls = state["completed_tool_calls"]
+        for idx, tc in enumerate(completed_tool_calls):
+            yield self._event_builder.tool_call(tc, source=tc["name"], job=idx + 1)
+
+        api_usage = state["api_usage"]
+        stream_tokens = int(state["tokens"])
+        completion_tokens = api_usage.get("completion_tokens")
+        tokens = int(completion_tokens) if completion_tokens is not None else stream_tokens
+        total_tokens = api_usage.get("total_tokens")
+        prompt_tokens = api_usage.get("prompt_tokens")
+        if total_tokens is None and prompt_tokens is not None:
+            total_tokens = int(prompt_tokens) + tokens
+
+        verbose_info: VerboseInfo = {
+            "tokens": tokens,
+            "tokens_per_second": tokens / elapsed if elapsed > 0 else 0,
+            "latency": latency,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens if completion_tokens is not None else stream_tokens,
+            "total_tokens": total_tokens,
+        }
+
+        if verbose:
+            yield self._event_builder.verbose(verbose_info)
+
+        if final:
+            final_response: FinalResponse = {
+                "answer": answer.strip() if isinstance(answer, str) else answer
+            }
+            thinking = state["thinking"]
+            if not hide_thinking and thinking.strip():
+                final_response["reasoning"] = thinking.strip()
+            if completed_tool_calls:
+                final_response["tool_calls"] = completed_tool_calls
+            if verbose:
+                final_response["verbose"] = verbose_info
+            yield self._event_builder.final(final_response)
+
+        yield self._event_builder.done()
 
     def _build_responses_request(
         self,
@@ -1119,9 +1327,9 @@ class LLM:
         if structured_output:
             kwargs["text"] = {"format": self._convert_output_format_for_responses_api(output_format)}
 
-        extra = extra_body or self._config.extra_body
-        if extra:
-            kwargs["extra_body"] = extra
+        merged_extra_body = _deep_merge_dicts(self._config.extra_body, extra_body)
+        if merged_extra_body:
+            kwargs["extra_body"] = merged_extra_body
 
         return kwargs, prepared_tools, structured_output
 
@@ -1145,18 +1353,9 @@ class LLM:
             messages, output_format, tools, reasoning_effort, max_tokens, extra_body
         )
 
-        thinking = ""
-        answer = ""
-        tokens = 0
-        api_usage: Dict[str, Optional[int]] = {}
+        state = self._new_responses_state()
         start_time = time.perf_counter()
         latency: Optional[float] = None
-
-        # Tool call state:
-        # item_id → {"call_id": str, "name": str}  (populated on output_item.added)
-        pending_tool_items: Dict[str, Dict[str, str]] = {}
-        pending_tool_indexes: Dict[int, Dict[str, str]] = {}
-        completed_tool_calls: List[ToolCall] = []
 
         try:
             stream = self._client.responses.create(**kwargs)
@@ -1167,118 +1366,18 @@ class LLM:
             for event in stream:
                 if latency is None:
                     latency = time.perf_counter() - start_time
-                tokens += 1
-                etype = getattr(event, "type", "")
-                if etype == "response.completed":
-                    response = getattr(event, "response", None)
-                    api_usage = self._read_usage(getattr(response, "usage", None))
-
-                # ── Answer text ──────────────────────────────────────────
-                if etype == "response.output_text.delta":
-                    chunk = getattr(event, "delta", "") or ""
-                    if chunk:
-                        answer += chunk
-                        if not structured_output:
-                            yield self._event_builder.answer(chunk)
-
-                # ── Reasoning / Thinking ─────────────────────────────────
-                elif etype in (
-                    "response.reasoning_summary_text.delta",
-                    "response.reasoning_text.delta",
+                for emitted in self._handle_responses_event(
+                    event, state, structured_output, hide_thinking
                 ):
-                    chunk = getattr(event, "delta", "") or ""
-                    if chunk:
-                        thinking += chunk
-                        if not hide_thinking:
-                            yield self._event_builder.reasoning(chunk)
-
-                # ── Tool call: item announced ─────────────────────────────
-                elif etype == "response.output_item.added":
-                    item = getattr(event, "item", None)
-                    if item and getattr(item, "type", "") == "function_call":
-                        output_index = getattr(event, "output_index", None)
-                        pending = {
-                            "call_id": getattr(item, "call_id", None) or getattr(item, "id", ""),
-                            "name": getattr(item, "name", "") or "",
-                        }
-                        pending_tool_items[getattr(item, "id", "")] = pending
-                        if output_index is not None:
-                            pending_tool_indexes[int(output_index)] = pending
-
-                elif etype == "response.output_item.done":
-                    item = getattr(event, "item", None)
-                    if item and getattr(item, "type", "") == "function_call":
-                        output_index = getattr(event, "output_index", None)
-                        pending = pending_tool_items.setdefault(getattr(item, "id", ""), {})
-                        pending["call_id"] = getattr(item, "call_id", None) or pending.get("call_id", "") or getattr(item, "id", "")
-                        pending["name"] = getattr(item, "name", "") or pending.get("name", "")
-                        if output_index is not None:
-                            pending_tool_indexes[int(output_index)] = pending
-
-                # ── Tool call: arguments complete ─────────────────────────
-                elif etype == "response.function_call_arguments.done":
-                    item_id = getattr(event, "item_id", None)
-                    output_index = getattr(event, "output_index", None)
-                    args_str = getattr(event, "arguments", "{}") or "{}"
-                    fn_name = getattr(event, "name", "")
-
-                    pending = pending_tool_items.pop(item_id, {}) if item_id else {}
-                    if not pending and output_index is not None:
-                        pending = pending_tool_indexes.get(int(output_index), {})
-                    call_id = pending.get("call_id", item_id or "")
-                    fn_name = fn_name or pending.get("name", "")
-
-                    try:
-                        args = json.loads(args_str)
-                    except json.JSONDecodeError:
-                        args = {"_raw": args_str}
-
-                    completed_tool_calls.append({
-                        "id": call_id,
-                        "name": fn_name,
-                        "arguments": args,
-                    })
+                    yield emitted
 
         except Exception as e:
             raise ModelRequestError(f"Responses API stream failed: {e}") from e
 
         elapsed = time.perf_counter() - start_time
-        tps = tokens / elapsed if elapsed > 0 else 0
-
-        # Structured output: parse accumulated JSON
-        if structured_output:
-            try:
-                answer = json.loads(answer)
-            except json.JSONDecodeError:
-                pass
-            yield self._event_builder.answer(answer)
-
-        # Emit completed tool calls
-        for idx, tc in enumerate(completed_tool_calls):
-            yield self._event_builder.tool_call(tc, source=tc["name"], job=idx + 1)
-
-        verbose_info: VerboseInfo = {
-            "tokens": tokens,
-            "tokens_per_second": tps,
-            "latency": latency,
-            **api_usage,
-        }
-        if verbose:
-            yield self._event_builder.verbose(verbose_info)
-
-        if final:
-            final_response: FinalResponse = {
-                "answer": answer.strip() if isinstance(answer, str) else answer
-            }
-            if not hide_thinking and thinking.strip():
-                final_response["reasoning"] = thinking.strip()
-            if completed_tool_calls:
-                final_response["tool_calls"] = completed_tool_calls
-            if verbose:
-                final_response["verbose"] = verbose_info
-            yield self._event_builder.final(final_response)
-
-        yield self._event_builder.done()
+        yield from self._finalize_responses_stream(
+            state, structured_output, verbose, final, hide_thinking, latency, elapsed
+        )
 
     async def _stream_responses_async(
         self,
@@ -1300,16 +1399,9 @@ class LLM:
             messages, output_format, tools, reasoning_effort, max_tokens, extra_body
         )
 
-        thinking = ""
-        answer = ""
-        tokens = 0
-        api_usage: Dict[str, Optional[int]] = {}
+        state = self._new_responses_state()
         start_time = time.perf_counter()
         latency: Optional[float] = None
-
-        pending_tool_items: Dict[str, Dict[str, str]] = {}
-        pending_tool_indexes: Dict[int, Dict[str, str]] = {}
-        completed_tool_calls: List[ToolCall] = []
 
         try:
             create_call = self._async_client.responses.create(**kwargs)
@@ -1321,116 +1413,23 @@ class LLM:
             async for event in stream:
                 if latency is None:
                     latency = time.perf_counter() - start_time
-                tokens += 1
-                etype = getattr(event, "type", "")
-                if etype == "response.completed":
-                    response = getattr(event, "response", None)
-                    api_usage = self._read_usage(getattr(response, "usage", None))
-
-                if etype == "response.output_text.delta":
-                    chunk = getattr(event, "delta", "") or ""
-                    if chunk:
-                        answer += chunk
-                        if not structured_output:
-                            yield self._event_builder.answer(chunk)
-
-                elif etype in (
-                    "response.reasoning_summary_text.delta",
-                    "response.reasoning_text.delta",
+                for emitted in self._handle_responses_event(
+                    event, state, structured_output, hide_thinking
                 ):
-                    chunk = getattr(event, "delta", "") or ""
-                    if chunk:
-                        thinking += chunk
-                        if not hide_thinking:
-                            yield self._event_builder.reasoning(chunk)
-
-                elif etype == "response.output_item.added":
-                    item = getattr(event, "item", None)
-                    if item and getattr(item, "type", "") == "function_call":
-                        output_index = getattr(event, "output_index", None)
-                        pending = {
-                            "call_id": getattr(item, "call_id", None) or getattr(item, "id", ""),
-                            "name": getattr(item, "name", "") or "",
-                        }
-                        pending_tool_items[getattr(item, "id", "")] = pending
-                        if output_index is not None:
-                            pending_tool_indexes[int(output_index)] = pending
-
-                elif etype == "response.output_item.done":
-                    item = getattr(event, "item", None)
-                    if item and getattr(item, "type", "") == "function_call":
-                        output_index = getattr(event, "output_index", None)
-                        pending = pending_tool_items.setdefault(getattr(item, "id", ""), {})
-                        pending["call_id"] = getattr(item, "call_id", None) or pending.get("call_id", "") or getattr(item, "id", "")
-                        pending["name"] = getattr(item, "name", "") or pending.get("name", "")
-                        if output_index is not None:
-                            pending_tool_indexes[int(output_index)] = pending
-
-                elif etype == "response.function_call_arguments.done":
-                    item_id = getattr(event, "item_id", None)
-                    output_index = getattr(event, "output_index", None)
-                    args_str = getattr(event, "arguments", "{}") or "{}"
-                    fn_name = getattr(event, "name", "")
-
-                    pending = pending_tool_items.pop(item_id, {}) if item_id else {}
-                    if not pending and output_index is not None:
-                        pending = pending_tool_indexes.get(int(output_index), {})
-                    call_id = pending.get("call_id", item_id or "")
-                    fn_name = fn_name or pending.get("name", "")
-
-                    try:
-                        args = json.loads(args_str)
-                    except json.JSONDecodeError:
-                        args = {"_raw": args_str}
-
-                    completed_tool_calls.append({
-                        "id": call_id,
-                        "name": fn_name,
-                        "arguments": args,
-                    })
+                    yield emitted
 
         except Exception as e:
             raise ModelRequestError(f"Async Responses API stream failed: {e}") from e
 
         elapsed = time.perf_counter() - start_time
-        tps = tokens / elapsed if elapsed > 0 else 0
-
-        if structured_output:
-            try:
-                answer = json.loads(answer)
-            except json.JSONDecodeError:
-                pass
-            yield self._event_builder.answer(answer)
-
-        for idx, tc in enumerate(completed_tool_calls):
-            yield self._event_builder.tool_call(tc, source=tc["name"], job=idx + 1)
-
-        verbose_info: VerboseInfo = {
-            "tokens": tokens,
-            "tokens_per_second": tps,
-            "latency": latency,
-            **api_usage,
-        }
-        if verbose:
-            yield self._event_builder.verbose(verbose_info)
-
-        if final:
-            final_response: FinalResponse = {
-                "answer": answer.strip() if isinstance(answer, str) else answer
-            }
-            if not hide_thinking and thinking.strip():
-                final_response["reasoning"] = thinking.strip()
-            if completed_tool_calls:
-                final_response["tool_calls"] = completed_tool_calls
-            if verbose:
-                final_response["verbose"] = verbose_info
-            yield self._event_builder.final(final_response)
-
-        yield self._event_builder.done()
+        for emitted in self._finalize_responses_stream(
+            state, structured_output, verbose, final, hide_thinking, latency, elapsed
+        ):
+            yield emitted
 
     def response(
         self,
-        messages: List[Dict[str, Any]],
+        messages: Optional[InputValue] = None,
         output_format: Union[Dict, type, None] = None,
         tools: Optional[List] = None,
         verbose: bool = False,
@@ -1438,18 +1437,17 @@ class LLM:
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
+        input: Optional[InputValue] = None,
     ) -> FinalResponse:
         """Request model inference (non-streaming)."""
-        if messages is None:
-            raise ValueError("messages must be provided")
-
+        resolved_messages = _resolve_messages(messages, input)
         output_format = self._prepare_output_format(output_format)
 
         final_content = None
         last_answer = ""
 
         for event in self.stream_response(
-            messages=messages,
+            messages=resolved_messages,
             output_format=output_format,
             final=True,
             tools=tools,
@@ -1457,7 +1455,7 @@ class LLM:
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
             verbose=verbose,
-            extra_body=extra_body or self._config.extra_body,
+            extra_body=extra_body,
         ):
             if event.get("type") == EventType.ANSWER.value:
                 content = event.get("content")
@@ -1474,7 +1472,7 @@ class LLM:
 
     def stream_response(
         self,
-        messages: List[Dict],
+        messages: Optional[InputValue] = None,
         output_format: Union[Dict, type, None] = None,
         final: bool = False,
         tools: Optional[List] = None,
@@ -1483,15 +1481,14 @@ class LLM:
         max_tokens: Optional[int] = None,
         verbose: bool = False,
         extra_body: Optional[Dict] = None,
+        input: Optional[InputValue] = None,
     ) -> Generator[StreamEvent, None, None]:
         """Request model inference with streaming."""
-        if messages is None:
-            raise ValueError("messages must be provided")
-
+        resolved_messages = _resolve_messages(messages, input)
         output_format = self._prepare_output_format(output_format)
         if self._config.use_responses_api:
             yield from self._stream_responses_sync(
-                messages=messages,
+                messages=resolved_messages,
                 output_format=output_format,
                 tools=tools,
                 reasoning_effort=reasoning_effort,
@@ -1504,7 +1501,7 @@ class LLM:
             return
 
         kwargs, _, structured_output = self._build_request(
-            messages, output_format, tools, reasoning_effort, max_tokens, extra_body
+            resolved_messages, output_format, tools, reasoning_effort, max_tokens, extra_body
         )
 
         thinking_parser = ThinkingParser(self._config.custom_thinking_token)
@@ -1629,7 +1626,7 @@ class LLM:
 
     async def async_response(
         self,
-        messages: List[Dict[str, Any]],
+        messages: Optional[InputValue] = None,
         output_format: Union[Dict, type, None] = None,
         tools: Optional[List] = None,
         verbose: bool = False,
@@ -1637,16 +1634,15 @@ class LLM:
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
+        input: Optional[InputValue] = None,
     ) -> FinalResponse:
         """Async request for model inference."""
-        if messages is None:
-            raise ValueError("messages must be provided")
-
+        resolved_messages = _resolve_messages(messages, input)
         output_format = self._prepare_output_format(output_format)
 
         final_content = None
         async for event in self.async_stream_response(
-            messages=messages,
+            messages=resolved_messages,
             output_format=output_format,
             final=True,
             tools=tools,
@@ -1654,7 +1650,7 @@ class LLM:
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
             verbose=verbose,
-            extra_body=extra_body or self._config.extra_body,
+            extra_body=extra_body,
         ):
             if event.get("type") == EventType.FINAL.value:
                 final_content = event.get("content")
@@ -1667,7 +1663,7 @@ class LLM:
 
     async def async_stream_response(
         self,
-        messages: List[Dict],
+        messages: Optional[InputValue] = None,
         output_format: Union[Dict, type, None] = None,
         final: bool = False,
         tools: Optional[List] = None,
@@ -1676,17 +1672,16 @@ class LLM:
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
+        input: Optional[InputValue] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Async streaming model inference."""
-        if messages is None:
-            raise ValueError("messages must be provided")
-
         import asyncio
 
+        resolved_messages = _resolve_messages(messages, input)
         output_format = self._prepare_output_format(output_format)
         if self._config.use_responses_api:
             async for event in self._stream_responses_async(
-                messages=messages,
+                messages=resolved_messages,
                 output_format=output_format,
                 tools=tools,
                 reasoning_effort=reasoning_effort,
@@ -1700,7 +1695,7 @@ class LLM:
             return
 
         kwargs, _, structured_output = self._build_request(
-            messages, output_format, tools, reasoning_effort, max_tokens, extra_body
+            resolved_messages, output_format, tools, reasoning_effort, max_tokens, extra_body
         )
 
         thinking_parser = ThinkingParser(self._config.custom_thinking_token)
@@ -1831,7 +1826,11 @@ class LLM:
         _close_async_resource(self._async_client)
 
     async def aclose(self) -> None:
-        await self._async_client.close()
+        if hasattr(self._client, "close"):
+            self._client.close()
+        close_result = self._async_client.close()
+        if inspect.isawaitable(close_result):
+            await close_result
 
     def __enter__(self):
         return self

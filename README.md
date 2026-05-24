@@ -41,21 +41,26 @@ llm = LLM(
     api_key="lm-studio",
 )
 
-response = llm.response([
-    {"role": "user", "content": "Write a tiny haiku about fast code."}
-])
+response = llm.response(input="Write a tiny haiku about fast code.")
 
 print(response["answer"])
 ```
 
 By default, `base_url="http://localhost:1234/v1"` and `api_key="lm-studio"`, so local LM Studio-style servers work with very little setup.
 
+All inference methods accept either `input="..."` for the common single-user-message case or a Chat Completions-style message list:
+
+```python
+response = llm.response(messages=[
+    {"role": "system", "content": "Be concise."},
+    {"role": "user", "content": "Write a tiny haiku about fast code."},
+])
+```
+
 ## 📡 Streaming
 
 ```python
-for event in llm.stream_response([
-    {"role": "user", "content": "Explain adapters in one paragraph."}
-]):
+for event in llm.stream_response(input="Explain adapters in one paragraph."):
     if event["type"] == "answer":
         print(event["content"], end="", flush=True)
 ```
@@ -80,10 +85,8 @@ import asyncio
 from llm_sdk import LLM
 
 async def main():
-    async with LLM(model="gpt-5.5", api_key="sk-...", base_url="https://api.openai.com/v1",use_responses_api=True) as llm:
-        response = await llm.async_response([
-            {"role": "user", "content": "Give me a crisp project name."}
-        ])
+    async with LLM(model="gpt-5.5", api_key="sk-...", base_url="https://api.openai.com/v1", use_responses_api=True) as llm:
+        response = await llm.async_response(input="Give me a crisp project name.")
         print(response["answer"])
 
 asyncio.run(main())
@@ -100,7 +103,7 @@ class Verdict:
     tags: list[str]
 
 result = llm.response(
-    [{"role": "user", "content": "Review: fast, small, surprisingly nice."}],
+    input="Review: fast, small, surprisingly nice.",
     output_format=Verdict,
 )
 
@@ -119,7 +122,7 @@ def search_docs(query: str, limit: int = 5) -> str:
     return "..."
 
 response = llm.response(
-    [{"role": "user", "content": "Find the auth setup notes."}],
+    input="Find the auth setup notes.",
     tools=[search_docs],
 )
 
@@ -168,7 +171,7 @@ Use `reasoning_effort="high"` to set models's reasoning effort.
 
 ```python
 response = llm.response(
-    [{"role": "user", "content": "..."}],
+    input="...",
     reasoning_effort="high"
 )
 ```
@@ -177,6 +180,7 @@ response = llm.response(
 
 - `response(...)` and `stream_response(...)`
 - `async_response(...)` and `async_stream_response(...)`
+- `input="..."` or `messages=[...]` for all inference methods
 - `list_models(fallback=[...])`
 - `reasoning_effort="low|medium|high"` where supported
 - `hide_thinking=False` to stream/return reasoning content
