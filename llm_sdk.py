@@ -936,6 +936,9 @@ class LLM:
         reasoning_effort: Optional[str],
         max_tokens: Optional[int],
         extra_body: Optional[Dict],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> tuple[Dict[str, Any], PreparedTools, bool]:
         """Build API request kwargs. Returns (kwargs, prepared_tools, structured_output)."""
         request_messages = copy.deepcopy(messages)
@@ -944,11 +947,15 @@ class LLM:
         structured_output = output_format is not None
 
         kwargs: Dict[str, Any] = {
-            "model": self._config.model,
+            "model": model or self._config.model,
             "messages": request_messages,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if top_p is not None:
+            kwargs["top_p"] = top_p
         if prepared_tools.definitions:
             kwargs["tools"] = prepared_tools.definitions
         if extra_body:
@@ -1076,6 +1083,9 @@ class LLM:
         reasoning_effort: Optional[str],
         max_tokens: Optional[int],
         extra_body: Optional[Dict],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> tuple[Dict[str, Any], PreparedTools, bool]:
         """
         Build a request payload for the Responses API (/v1/responses).
@@ -1084,45 +1094,48 @@ class LLM:
         # Deep-copy and run image processing (same as Chat Completions path)
         raw_messages = copy.deepcopy(messages)
         ImageProcessor.process_messages(raw_messages)
-
+        
         # Translate message content format
         input_messages: List[Dict] = []
         for msg in raw_messages:
             translated = dict(msg)
             translated["content"] = self._translate_content_for_responses_api(msg.get("content"))
             input_messages.append(translated)
-
+        
         prepared_tools = self._tool_preparator.prepare(tools)
         structured_output = output_format is not None
-
+        
         kwargs: Dict[str, Any] = {
-            "model": self._config.model,
+            "model": model or self._config.model,
             "input": input_messages,
             "stream": True,
         }
-
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if top_p is not None:
+            kwargs["top_p"] = top_p
         if prepared_tools.definitions:
             kwargs["tools"] = self._convert_tools_for_responses_api(prepared_tools.definitions)
-            model_name = self._config.model.lower()
+            model_name = (model or self._config.model).lower()
             if "gpt-5" in model_name or "gpt-4.1" in model_name:
                 kwargs.setdefault("parallel_tool_calls", True)
-
+        
         # Reasoning effort has a different key in the Responses API
         if reasoning_effort:
             kwargs["reasoning"] = {"effort": reasoning_effort}
-
+        
         # max_output_tokens replaces max_tokens
         if max_tokens is not None:
             kwargs["max_output_tokens"] = max_tokens
-
+        
         # Structured output via text.format instead of response_format
         if structured_output:
             kwargs["text"] = {"format": self._convert_output_format_for_responses_api(output_format)}
-
+        
         extra = extra_body or self._config.extra_body
         if extra:
             kwargs["extra_body"] = extra
-
+        
         return kwargs, prepared_tools, structured_output
 
     def _stream_responses_sync(
@@ -1136,33 +1149,39 @@ class LLM:
         hide_thinking: bool,
         final: bool,
         extra_body: Optional[Dict],
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Generator[StreamEvent, None, None]:
         """
         Sync streaming via the Responses API (/v1/responses).
         Yields the same StreamEvent format as the Chat Completions path.
         """
         kwargs, _, structured_output = self._build_responses_request(
-            messages, output_format, tools, reasoning_effort, max_tokens, extra_body
+            messages, output_format, tools, reasoning_effort, max_tokens, extra_body,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
         )
-
+        
         thinking = ""
         answer = ""
         tokens = 0
         api_usage: Dict[str, Optional[int]] = {}
         start_time = time.perf_counter()
         latency: Optional[float] = None
-
+        
         # Tool call state:
         # item_id → {"call_id": str, "name": str}  (populated on output_item.added)
         pending_tool_items: Dict[str, Dict[str, str]] = {}
         pending_tool_indexes: Dict[int, Dict[str, str]] = {}
         completed_tool_calls: List[ToolCall] = []
-
+        
         try:
             stream = self._client.responses.create(**kwargs)
         except Exception as e:
             raise ModelRequestError(f"Responses API request failed: {e}")
-
+        
         try:
             for event in stream:
                 if latency is None:
@@ -1172,7 +1191,7 @@ class LLM:
                 if etype == "response.completed":
                     response = getattr(event, "response", None)
                     api_usage = self._read_usage(getattr(response, "usage", None))
-
+        
                 # ── Answer text ──────────────────────────────────────────
                 if etype == "response.output_text.delta":
                     chunk = getattr(event, "delta", "") or ""
@@ -1180,7 +1199,7 @@ class LLM:
                         answer += chunk
                         if not structured_output:
                             yield self._event_builder.answer(chunk)
-
+        
                 # ── Reasoning / Thinking ─────────────────────────────────
                 elif etype in (
                     "response.reasoning_summary_text.delta",
@@ -1191,7 +1210,7 @@ class LLM:
                         thinking += chunk
                         if not hide_thinking:
                             yield self._event_builder.reasoning(chunk)
-
+        
                 # ── Tool call: item announced ─────────────────────────────
                 elif etype == "response.output_item.added":
                     item = getattr(event, "item", None)
@@ -1204,7 +1223,7 @@ class LLM:
                         pending_tool_items[getattr(item, "id", "")] = pending
                         if output_index is not None:
                             pending_tool_indexes[int(output_index)] = pending
-
+        
                 elif etype == "response.output_item.done":
                     item = getattr(event, "item", None)
                     if item and getattr(item, "type", "") == "function_call":
@@ -1214,37 +1233,37 @@ class LLM:
                         pending["name"] = getattr(item, "name", "") or pending.get("name", "")
                         if output_index is not None:
                             pending_tool_indexes[int(output_index)] = pending
-
+        
                 # ── Tool call: arguments complete ─────────────────────────
                 elif etype == "response.function_call_arguments.done":
                     item_id = getattr(event, "item_id", None)
                     output_index = getattr(event, "output_index", None)
                     args_str = getattr(event, "arguments", "{}") or "{}"
                     fn_name = getattr(event, "name", "")
-
+        
                     pending = pending_tool_items.pop(item_id, {}) if item_id else {}
                     if not pending and output_index is not None:
                         pending = pending_tool_indexes.get(int(output_index), {})
                     call_id = pending.get("call_id", item_id or "")
                     fn_name = fn_name or pending.get("name", "")
-
+        
                     try:
                         args = json.loads(args_str)
                     except json.JSONDecodeError:
                         args = {"_raw": args_str}
-
+        
                     completed_tool_calls.append({
                         "id": call_id,
                         "name": fn_name,
                         "arguments": args,
                     })
-
+        
         except Exception as e:
             raise ModelRequestError(f"Responses API stream failed: {e}") from e
-
+        
         elapsed = time.perf_counter() - start_time
         tps = tokens / elapsed if elapsed > 0 else 0
-
+        
         # Structured output: parse accumulated JSON
         if structured_output:
             try:
@@ -1252,11 +1271,11 @@ class LLM:
             except json.JSONDecodeError:
                 pass
             yield self._event_builder.answer(answer)
-
+        
         # Emit completed tool calls
         for idx, tc in enumerate(completed_tool_calls):
             yield self._event_builder.tool_call(tc, source=tc["name"], job=idx + 1)
-
+        
         verbose_info: VerboseInfo = {
             "tokens": tokens,
             "tokens_per_second": tps,
@@ -1265,7 +1284,7 @@ class LLM:
         }
         if verbose:
             yield self._event_builder.verbose(verbose_info)
-
+        
         if final:
             final_response: FinalResponse = {
                 "answer": answer.strip() if isinstance(answer, str) else answer
@@ -1277,7 +1296,7 @@ class LLM:
             if verbose:
                 final_response["verbose"] = verbose_info
             yield self._event_builder.final(final_response)
-
+        
         yield self._event_builder.done()
 
     async def _stream_responses_async(
@@ -1438,6 +1457,9 @@ class LLM:
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> FinalResponse:
         """Request model inference (non-streaming)."""
         if messages is None:
@@ -1458,6 +1480,9 @@ class LLM:
             max_tokens=max_tokens,
             verbose=verbose,
             extra_body=extra_body or self._config.extra_body,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
         ):
             if event.get("type") == EventType.ANSWER.value:
                 content = event.get("content")
@@ -1483,6 +1508,9 @@ class LLM:
         max_tokens: Optional[int] = None,
         verbose: bool = False,
         extra_body: Optional[Dict] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Generator[StreamEvent, None, None]:
         """Request model inference with streaming."""
         if messages is None:
@@ -1500,11 +1528,17 @@ class LLM:
                 hide_thinking=hide_thinking,
                 final=final,
                 extra_body=extra_body,
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
             )
             return
 
         kwargs, _, structured_output = self._build_request(
-            messages, output_format, tools, reasoning_effort, max_tokens, extra_body
+            messages, output_format, tools, reasoning_effort, max_tokens, extra_body,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
         )
 
         thinking_parser = ThinkingParser(self._config.custom_thinking_token)
