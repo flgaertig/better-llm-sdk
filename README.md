@@ -8,6 +8,7 @@ One file, clean API, boring on purpose. Use it with local servers, OpenAI-style 
 
 - Sync and async clients
 - Streaming and non-streaming responses
+- Configurable retry with per-call override
 - OpenAI Chat Completions support
 - Optional OpenAI Responses API mode
 - Structured output from JSON schema or typed Python classes
@@ -90,6 +91,16 @@ async def main():
         print(response["answer"])
 
 asyncio.run(main())
+```
+## 🔄 Retry
+
+Set `max_retries` globally or override it per call.
+
+```python
+# global
+llm = LLM(model="qwen3.6-27b", max_retries=5)
+# per call
+llm.response(input="...", max_retries=0)
 ```
 
 ## 📐 Structured Output
@@ -181,7 +192,8 @@ response = llm.response(
 - `response(...)` and `stream_response(...)`
 - `async_response(...)` and `async_stream_response(...)`
 - `input="..."` or `messages=[...]` for all inference methods
-- `list_models(fallback=[...])`
+- `list_models(fallback=[...])` and `async_list_models(fallback=[...])`
+- `max_retries=3` globally on `LLM(...)` or per call
 - `reasoning_effort="low|medium|high"` where supported
 - `hide_thinking=False` to stream/return reasoning content
 - `CustomThinkingToken(...)` for custom `<think>`-style parsing
