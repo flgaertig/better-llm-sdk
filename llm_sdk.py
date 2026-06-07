@@ -32,7 +32,7 @@ from typing import (
     TYPE_CHECKING
 )
 
-from openai import OpenAI, AsyncOpenAI
+from openai import OpenAI, AsyncOpenAI, APIStatusError
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
@@ -266,6 +266,7 @@ class LLMConfig:
     extra_body: Optional[Dict[str, Any]] = None
     use_responses_api: bool = False
     default_headers: Optional[Dict[str, str]] = None
+    max_retries: int = 3
 
 # ============================================================================
 # Thinking Parser
@@ -901,6 +902,7 @@ class LLM:
         extra_body: Optional[Dict[str, Any]] = None,
         use_responses_api: bool = False,
         default_headers: Optional[Dict[str, str]] = None,
+        max_retries: int = 3,
     ):
         self._config = LLMConfig(
             model=model,
@@ -912,6 +914,7 @@ class LLM:
             extra_body=extra_body,
             use_responses_api=use_responses_api,
             default_headers=default_headers,
+            max_retries=max_retries,
         )
 
         self._api_base = self._compute_api_base()
@@ -921,12 +924,14 @@ class LLM:
             api_key=api_key,
             timeout=self._config.timeout,
             default_headers=default_headers,
+            max_retries=self._config.max_retries,
         )
         self._async_client = AsyncOpenAI(
             base_url=self._api_base,
             api_key=api_key,
             timeout=self._config.timeout,
             default_headers=default_headers,
+            max_retries=self._config.max_retries,
         )
 
         self._schema_converter = SchemaConverter()
@@ -950,10 +955,24 @@ class LLM:
     def base_url(self) -> str:
         return self._config.base_url
 
-    def list_models(self, fallback: Optional[List[str]] = None) -> List[str]:
+    def list_models(self, fallback: Optional[List[str]] = None, max_retries: Optional[int] = None,) -> List[str]:
         """Return model IDs from the configured API, or fallback/[] on failure."""
         try:
-            return sorted({model.id for model in self._client.models.list().data})
+            client = self._client if max_retries is None else self._client.with_options(max_retries=max_retries)
+            return sorted({model.id for model in client.models.list().data})
+        except Exception:
+            return list(fallback or [])
+        
+    async def async_list_models(
+        self,
+        fallback: Optional[List[str]] = None,
+        max_retries: Optional[int] = None,
+    ) -> List[str]:
+        """Async return model IDs from the configured API, or fallback/[] on failure."""
+        try:
+            client = self._async_client if max_retries is None else self._async_client.with_options(max_retries=max_retries)
+            models = await client.models.list()
+            return sorted({model.id for model in models.data})
         except Exception:
             return list(fallback or [])
 
@@ -1344,6 +1363,7 @@ class LLM:
         hide_thinking: bool,
         final: bool,
         extra_body: Optional[Dict],
+        max_retries: Optional[int] = None,
     ) -> Generator[StreamEvent, None, None]:
         """
         Sync streaming via the Responses API (/v1/responses).
@@ -1357,8 +1377,10 @@ class LLM:
         start_time = time.perf_counter()
         latency: Optional[float] = None
 
+        client = self._client if max_retries is None else self._client.with_options(max_retries=max_retries)
+
         try:
-            stream = self._client.responses.create(**kwargs)
+            stream = client.responses.create(**kwargs)
         except Exception as e:
             raise ModelRequestError(f"Responses API request failed: {e}")
 
@@ -1390,6 +1412,7 @@ class LLM:
         hide_thinking: bool,
         final: bool,
         extra_body: Optional[Dict],
+        max_retries: Optional[int] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Async streaming via the Responses API (/v1/responses).
@@ -1403,9 +1426,14 @@ class LLM:
         start_time = time.perf_counter()
         latency: Optional[float] = None
 
+        client = self._async_client if max_retries is None else self._async_client.with_options(max_retries=max_retries)
+
+        async def _acreate(c):
+            call = c.responses.create(**kwargs)
+            return await call if asyncio.iscoroutine(call) else call
+
         try:
-            create_call = self._async_client.responses.create(**kwargs)
-            stream = await create_call if asyncio.iscoroutine(create_call) else create_call
+            stream = await _acreate(client)
         except Exception as e:
             raise ModelRequestError(f"Async Responses API request failed: {e}")
 
@@ -1438,13 +1466,13 @@ class LLM:
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
         input: Optional[InputValue] = None,
+        max_retries: Optional[int] = None,
     ) -> FinalResponse:
         """Request model inference (non-streaming)."""
         resolved_messages = _resolve_messages(messages, input)
         output_format = self._prepare_output_format(output_format)
 
         final_content = None
-        last_answer = ""
 
         for event in self.stream_response(
             messages=resolved_messages,
@@ -1456,17 +1484,14 @@ class LLM:
             max_tokens=max_tokens,
             verbose=verbose,
             extra_body=extra_body,
+            max_retries=max_retries,
         ):
-            if event.get("type") == EventType.ANSWER.value:
-                content = event.get("content")
-                if isinstance(content, str):
-                    last_answer += content
-            elif event.get("type") == EventType.FINAL.value:
+            if event.get("type") == EventType.FINAL.value:
                 final_content = event.get("content")
                 break
 
         if final_content is None:
-            return {"answer": last_answer}
+            raise RuntimeError("No final response received")
 
         return final_content
 
@@ -1481,6 +1506,7 @@ class LLM:
         max_tokens: Optional[int] = None,
         verbose: bool = False,
         extra_body: Optional[Dict] = None,
+        max_retries: Optional[int] = None,
         input: Optional[InputValue] = None,
     ) -> Generator[StreamEvent, None, None]:
         """Request model inference with streaming."""
@@ -1497,6 +1523,7 @@ class LLM:
                 hide_thinking=hide_thinking,
                 final=final,
                 extra_body=extra_body,
+                max_retries=max_retries,
             )
             return
 
@@ -1513,18 +1540,22 @@ class LLM:
         latency: Optional[float] = None
         tokens = 0
 
+        client = self._client if max_retries is None else self._client.with_options(max_retries=max_retries)
+
+        def _create(c):
+            try:
+                return c.chat.completions.create(**kwargs)
+            except APIStatusError as e:
+                if "stream_options" in kwargs and e.status_code in (400, 422):
+                    kwargs_copy = dict(kwargs)
+                    kwargs_copy.pop("stream_options", None)
+                    return c.chat.completions.create(**kwargs_copy)
+                raise
+
         try:
-            completion = self._client.chat.completions.create(**kwargs)
+            completion = _create(client)
         except Exception as e:
-            if "stream_options" in kwargs:
-                kwargs_copy = dict(kwargs)
-                kwargs_copy.pop("stream_options", None)
-                try:
-                    completion = self._client.chat.completions.create(**kwargs_copy)
-                except Exception as inner_e:
-                    raise ModelRequestError(f"Model request failed: {inner_e}")
-            else:
-                raise ModelRequestError(f"Model request failed: {e}")
+            raise ModelRequestError(f"Model request failed: {e}") from e
 
         prompt_tokens = 0
         completion_tokens = 0
@@ -1635,6 +1666,7 @@ class LLM:
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
         input: Optional[InputValue] = None,
+        max_retries: Optional[int] = None,
     ) -> FinalResponse:
         """Async request for model inference."""
         resolved_messages = _resolve_messages(messages, input)
@@ -1651,6 +1683,7 @@ class LLM:
             max_tokens=max_tokens,
             verbose=verbose,
             extra_body=extra_body,
+            max_retries=max_retries,
         ):
             if event.get("type") == EventType.FINAL.value:
                 final_content = event.get("content")
@@ -1673,9 +1706,9 @@ class LLM:
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
         input: Optional[InputValue] = None,
+        max_retries: Optional[int] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Async streaming model inference."""
-        import asyncio
 
         resolved_messages = _resolve_messages(messages, input)
         output_format = self._prepare_output_format(output_format)
@@ -1690,6 +1723,7 @@ class LLM:
                 hide_thinking=hide_thinking,
                 final=final,
                 extra_body=extra_body,
+                max_retries=max_retries,
             ):
                 yield event
             return
@@ -1707,20 +1741,24 @@ class LLM:
         latency: Optional[float] = None
         tokens = 0
 
+        client = self._async_client if max_retries is None else self._async_client.with_options(max_retries=max_retries)
+
+        async def _acreate(c):
+            try:
+                call = c.chat.completions.create(**kwargs)
+                return await call if asyncio.iscoroutine(call) else call
+            except APIStatusError as e:
+                if "stream_options" in kwargs and e.status_code in (400, 422):
+                    kwargs_copy = dict(kwargs)
+                    kwargs_copy.pop("stream_options", None)
+                    call = c.chat.completions.create(**kwargs_copy)
+                    return await call if asyncio.iscoroutine(call) else call
+                raise
+
         try:
-            create_call = self._async_client.chat.completions.create(**kwargs)
-            completion = await create_call if asyncio.iscoroutine(create_call) else create_call
+            completion = await _acreate(client)
         except Exception as e:
-            if "stream_options" in kwargs:
-                kwargs_copy = dict(kwargs)
-                kwargs_copy.pop("stream_options", None)
-                try:
-                    create_call = self._async_client.chat.completions.create(**kwargs_copy)
-                    completion = await create_call if asyncio.iscoroutine(create_call) else create_call
-                except Exception as inner_e:
-                    raise ModelRequestError(f"Async model request failed: {inner_e}")
-            else:
-                raise ModelRequestError(f"Async model request failed: {e}")
+            raise ModelRequestError(f"Async model request failed: {e}") from e
 
         prompt_tokens = 0
         completion_tokens = 0
