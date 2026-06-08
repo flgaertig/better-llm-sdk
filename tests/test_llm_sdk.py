@@ -187,6 +187,110 @@ class LLMSDKTests(unittest.TestCase):
                 finally:
                     llm.close()
 
+    def test_tool_call_stream_handler_logic(self):
+        from llm_sdk import ToolCallStreamHandler, EventBuilder
+        eb = EventBuilder()
+        handler = ToolCallStreamHandler(eb)
+
+        # 1. Chunk with tool call index=0 but no id/name (should not emit tool_call_part yet)
+        tc_chunk_1 = SimpleNamespace(
+            index=0,
+            id=None,
+            function=SimpleNamespace(name=None, arguments='{"ci')
+        )
+        events_1 = handler.process_chunk([tc_chunk_1])
+        self.assertEqual(events_1, [])
+
+        # 2. Chunk with tool call index=0, adding name/id (should emit tool_call_part with all accumulated delta)
+        tc_chunk_2 = SimpleNamespace(
+            index=0,
+            id="call_123",
+            function=SimpleNamespace(name="weather", arguments='ty":"Ber')
+        )
+        events_2 = handler.process_chunk([tc_chunk_2])
+        self.assertEqual(len(events_2), 1)
+        self.assertEqual(events_2[0]["type"], EventType.TOOL_CALL_PART.value)
+        self.assertEqual(events_2[0]["content"], {
+            "id": "call_123",
+            "name": "weather",
+            "args_delta": '{"city":"Ber'
+        })
+
+        # 3. Chunk with tool call index=0, further arguments
+        tc_chunk_3 = SimpleNamespace(
+            index=0,
+            id=None,
+            function=SimpleNamespace(name=None, arguments='lin"}')
+        )
+        events_3 = handler.process_chunk([tc_chunk_3])
+        self.assertEqual(len(events_3), 1)
+        self.assertEqual(events_3[0]["type"], EventType.TOOL_CALL_PART.value)
+        self.assertEqual(events_3[0]["content"], {
+            "id": "call_123",
+            "name": "weather",
+            "args_delta": 'lin"}'
+        })
+
+        # 4. End of the tool call part stream (no tool calls chunk or new index)
+        # Should yield the completed parsed JSON tool call
+        events_4 = handler.process_chunk(None)
+        self.assertEqual(len(events_4), 1)
+        self.assertEqual(events_4[0]["type"], EventType.TOOL_CALL.value)
+        self.assertEqual(events_4[0]["content"], {
+            "id": "call_123",
+            "name": "weather",
+            "arguments": {"city": "Berlin"}
+        })
+
+        # Check get_all_calls
+        all_calls = handler.get_all_calls()
+        self.assertEqual(all_calls, [{
+            "id": "call_123",
+            "name": "weather",
+            "arguments": {"city": "Berlin"}
+        }])
+
+        # Test parallel tool calls with switching
+        handler.clear()
+
+        # Stream tool call 0
+        events_a = handler.process_chunk([
+            SimpleNamespace(
+                index=0,
+                id="call_0",
+                function=SimpleNamespace(name="get_weather", arguments='{"city":"Berlin"}')
+            )
+        ])
+        # Stream tool call 1
+        events_b = handler.process_chunk([
+            SimpleNamespace(
+                index=1,
+                id="call_1",
+                function=SimpleNamespace(name="get_time", arguments='{"timezone":"UTC"}')
+            )
+        ])
+
+        # Tool call 0 should be emitted complete immediately upon switching to index 1
+        self.assertEqual(len(events_a), 1)  # Just the part event
+        self.assertEqual(events_a[0]["type"], EventType.TOOL_CALL_PART.value)
+
+        self.assertEqual(len(events_b), 2)  # Part event for index 1 + Complete event for index 0!
+        self.assertEqual(events_b[0]["type"], EventType.TOOL_CALL.value)
+        self.assertEqual(events_b[0]["content"]["id"], "call_0")
+        self.assertEqual(events_b[1]["type"], EventType.TOOL_CALL_PART.value)
+        self.assertEqual(events_b[1]["content"]["id"], "call_1")
+
+        # Finalize should return the remaining tool call 1
+        finalized = handler.finalize()
+        self.assertEqual(len(finalized), 1)
+        self.assertEqual(finalized[0]["id"], "call_1")
+
+        # get_all_calls should return both
+        all_calls = handler.get_all_calls()
+        self.assertEqual(len(all_calls), 2)
+        self.assertEqual(all_calls[0]["id"], "call_0")
+        self.assertEqual(all_calls[1]["id"], "call_1")
+
 
 if __name__ == "__main__":
     unittest.main()

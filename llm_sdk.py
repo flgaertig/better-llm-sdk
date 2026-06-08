@@ -28,7 +28,7 @@ from enum import Enum
 from typing import (
     Any, AsyncGenerator, Dict, Optional, List, Generator,
     Callable, Union, get_type_hints, get_origin, get_args,
-    Literal, TypedDict, TypeVar, Final, ClassVar,
+    Literal, TypedDict, TypeVar, Final, ClassVar, Set,
     TYPE_CHECKING
 )
 
@@ -148,6 +148,7 @@ class EventType(str, Enum):
     ANSWER = "answer"
     REASONING = "reasoning"
     TOOL_CALL = "tool_call"
+    TOOL_CALL_PART = "tool_call_part"
     VERBOSE = "verbose"
     FINAL = "final"
     DONE = "done"
@@ -174,15 +175,8 @@ T = TypeVar('T')
 
 
 class StreamEvent(TypedDict, total=False):
-    """Unified event format for all stream events."""
     type: str
     content: Any
-    source: Optional[str]
-    tool_id: Optional[str]
-    job: Optional[int]
-    depth: int
-
-
 class ToolCall(TypedDict):
     """Typed dictionary for tool calls."""
     id: str
@@ -785,98 +779,164 @@ class EventBuilder:
     """Builds standardized stream events."""
 
     @staticmethod
-    def _build(
-        event_type: EventType,
-        content: Any,
-        source: Optional[str] = None,
-        tool_id: Optional[str] = None,
-        job: Optional[int] = None,
-        depth: int = 0
-    ) -> StreamEvent:
-        event: StreamEvent = {
+    def _build(event_type: EventType, content: Any) -> StreamEvent:
+        return {
             "type": event_type.value,
             "content": content,
-            "source": source,
-            "depth": depth,
         }
-        if tool_id is not None:
-            event["tool_id"] = tool_id
-        if job is not None:
-            event["job"] = job
-        return event
 
     @staticmethod
-    def answer(content: Any, depth: int = 0) -> StreamEvent:
-        return EventBuilder._build(EventType.ANSWER, content, depth=depth)
+    def answer(content: Any) -> StreamEvent:
+        return EventBuilder._build(EventType.ANSWER, content)
 
     @staticmethod
-    def reasoning(content: str, depth: int = 0) -> StreamEvent:
-        return EventBuilder._build(EventType.REASONING, content, depth=depth)
+    def reasoning(content: str) -> StreamEvent:
+        return EventBuilder._build(EventType.REASONING, content)
 
     @staticmethod
-    def tool_call(content: ToolCall, source: Optional[str] = None, job: Optional[int] = None, depth: int = 0) -> StreamEvent:
-        return EventBuilder._build(EventType.TOOL_CALL, content, source, content.get("id"), job, depth)
+    def tool_call(content: ToolCall) -> StreamEvent:
+        return EventBuilder._build(EventType.TOOL_CALL, content)
 
     @staticmethod
-    def verbose(content: VerboseInfo, depth: int = 0) -> StreamEvent:
-        return EventBuilder._build(EventType.VERBOSE, content, depth=depth)
+    def tool_call_part(content: Dict[str, str]) -> StreamEvent:
+        return EventBuilder._build(EventType.TOOL_CALL_PART, content)
 
     @staticmethod
-    def final(content: FinalResponse, depth: int = 0) -> StreamEvent:
-        return EventBuilder._build(EventType.FINAL, content, depth=depth)
+    def verbose(content: VerboseInfo) -> StreamEvent:
+        return EventBuilder._build(EventType.VERBOSE, content)
 
     @staticmethod
-    def done(depth: int = 0) -> StreamEvent:
-        return EventBuilder._build(EventType.DONE, None, depth=depth)
+    def final(content: FinalResponse) -> StreamEvent:
+        return EventBuilder._build(EventType.FINAL, content)
+
+    @staticmethod
+    def done() -> StreamEvent:
+        return EventBuilder._build(EventType.DONE, None)
 
 # ============================================================================
-# Tool Call Accumulator
+# ToolCallStreamHandler
 # ============================================================================
+class ToolCallStreamHandler:
+    """Accumulates tool calls AND emits incremental tool_call_part events."""
 
-class ToolCallAccumulator:
-    """Accumulates streaming tool call chunks into complete calls."""
+    def __init__(self, event_builder: EventBuilder):
+        self._event_builder = event_builder
+        self._pending: Dict[int, Dict[str, Any]] = {}
+        self._active_index: Optional[int] = None
+        self._emitted_indices: Set[int] = set()
 
-    def __init__(self):
-        self._calls: Dict[str, Dict[str, str]] = {}
-        self._index_to_id: Dict[int, str] = {}
+    def process_chunk(self, tool_calls: Optional[List[Any]]) -> List[StreamEvent]:
+        events: List[StreamEvent] = []
 
-    def add_chunk(self, tool_call: Any) -> None:
-        idx = getattr(tool_call, "index", 0)
+        if not tool_calls:
+            if self._active_index is not None:
+                if self._active_index not in self._emitted_indices:
+                    if event := self._emit_complete_tool_call(self._active_index):
+                        events.append(event)
+                self._active_index = None
+            return events
 
-        if tool_id := getattr(tool_call, "id", None):
-            self._index_to_id[idx] = tool_id
+        for tc in tool_calls:
+            idx = getattr(tc, "index", 0)
 
-        tool_id = self._index_to_id.get(idx, f"_idx_{idx}")
+            if self._active_index is not None and idx != self._active_index:
+                if self._active_index not in self._emitted_indices:
+                    if event := self._emit_complete_tool_call(self._active_index):
+                        events.append(event)
 
-        if tool_id not in self._calls:
-            self._calls[tool_id] = {"name": "", "arguments": ""}
+            self._active_index = idx
 
-        func = tool_call.function
-        if func.name:
-            self._calls[tool_id]["name"] = func.name
-        if func.arguments:
-            args = func.arguments
-            if isinstance(args, dict):
-                args = json.dumps(args)
-            self._calls[tool_id]["arguments"] += args or ""
+            if idx not in self._pending:
+                self._pending[idx] = {
+                    "id": "",
+                    "name": "",
+                    "arguments": "",
+                    "buffer": "",
+                }
 
-    def get_completed_calls(self) -> List[ToolCall]:
+            p = self._pending[idx]
+
+            if tid := getattr(tc, "id", None):
+                p["id"] = tid
+
+            func = getattr(tc, "function", None)
+            if func is not None:
+                if func.name:
+                    p["name"] = func.name
+                if func.arguments:
+                    chunk = func.arguments
+                    if isinstance(chunk, dict):
+                        chunk = json.dumps(chunk)
+                    p["arguments"] += chunk
+                    p["buffer"] += chunk
+
+            if p["name"] and p["id"] and p["buffer"]:
+                events.append(
+                    self._event_builder.tool_call_part(
+                        content={
+                            "id": p["id"],
+                            "name": p["name"],
+                            "args_delta": p["buffer"],
+                        }
+                    )
+                )
+                p["buffer"] = ""
+
+        return events
+
+    def _emit_complete_tool_call(self, idx: int) -> Optional[StreamEvent]:
+        if idx not in self._pending:
+            return None
+        p = self._pending[idx]
+        if not p["id"] or not p["name"]:
+            return None
+
+        try:
+            args = json.loads(p["arguments"] or "{}")
+        except json.JSONDecodeError:
+            args = {"_raw": p["arguments"] or ""}
+
+        self._emitted_indices.add(idx)
+        return self._event_builder.tool_call({
+            "id": p["id"],
+            "name": p["name"],
+            "arguments": args,
+        })
+
+    def finalize(self) -> List[ToolCall]:
+        new_calls: List[ToolCall] = []
+        if self._active_index is not None and self._active_index not in self._emitted_indices:
+            event = self._emit_complete_tool_call(self._active_index)
+            if event:
+                content = event.get("content")
+                if content is not None:
+                    new_calls.append(content)
+        self._active_index = None
+        return new_calls
+
+    def get_all_calls(self) -> List[ToolCall]:
         result: List[ToolCall] = []
-        for tool_id, data in self._calls.items():
+        for idx in sorted(self._pending.keys()):
+            p = self._pending[idx]
+            if not p["id"] or not p["name"]:
+                continue
+
             try:
-                args = json.loads(data["arguments"] or "{}")
+                args = json.loads(p["arguments"] or "{}")
             except json.JSONDecodeError:
-                args = {"_raw": data["arguments"] or ""}
+                args = {"_raw": p["arguments"] or ""}
+
             result.append({
-                "id": tool_id,
-                "name": data["name"],
-                "arguments": args
+                "id": p["id"],
+                "name": p["name"],
+                "arguments": args,
             })
         return result
 
     def clear(self) -> None:
-        self._calls.clear()
-        self._index_to_id.clear()
+        self._pending.clear()
+        self._active_index = None
+        self._emitted_indices.clear()
 
 # ============================================================================
 # Main LLM Class
@@ -1192,6 +1252,7 @@ class LLM:
                 pending = {
                     "call_id": getattr(item, "call_id", None) or getattr(item, "id", ""),
                     "name": getattr(item, "name", "") or "",
+                    "arguments": "",
                 }
                 state["pending_tool_items"][getattr(item, "id", "")] = pending
                 if output_index is not None:
@@ -1209,30 +1270,69 @@ class LLM:
                     or getattr(item, "id", "")
                 )
                 pending["name"] = getattr(item, "name", "") or pending.get("name", "")
+                pending.setdefault("arguments", "")
                 if output_index is not None:
                     state["pending_tool_indexes"][int(output_index)] = pending
+            return emitted
+        
+        if etype == "response.function_call_arguments.delta":
+            item_id = getattr(event, "item_id", None)
+            output_index = getattr(event, "output_index", None)
+            delta = getattr(event, "delta", "") or ""
+
+            if item_id and item_id in state["pending_tool_items"]:
+                state["pending_tool_items"][item_id].setdefault("arguments", "")
+                state["pending_tool_items"][item_id]["arguments"] += delta
+            elif output_index is not None and int(output_index) in state["pending_tool_indexes"]:
+                p = state["pending_tool_indexes"][int(output_index)]
+                p.setdefault("arguments", "")
+                p["arguments"] += delta
+
+            pending = None
+            if item_id and item_id in state["pending_tool_items"]:
+                pending = state["pending_tool_items"][item_id]
+            elif output_index is not None:
+                pending = state["pending_tool_indexes"].get(int(output_index))
+
+            if pending and pending.get("call_id") and pending.get("name") and delta:
+                emitted.append(
+                    self._event_builder.tool_call_part(
+                        content={
+                            "id": pending["call_id"],
+                            "name": pending["name"],
+                            "args_delta": delta,
+                        }
+                    )
+                )
             return emitted
 
         if etype == "response.function_call_arguments.done":
             item_id = getattr(event, "item_id", None)
             output_index = getattr(event, "output_index", None)
-            args_str = getattr(event, "arguments", "{}") or "{}"
-            fn_name = getattr(event, "name", "")
-
+            
+            args_str = getattr(event, "arguments", None)
+            
             pending = state["pending_tool_items"].pop(item_id, {}) if item_id else {}
             if not pending and output_index is not None:
-                pending = state["pending_tool_indexes"].get(int(output_index), {})
+                pending = state["pending_tool_indexes"].pop(int(output_index), {})
+
+            if args_str is None:
+                args_str = pending.get("arguments", "{}") or "{}"
+            
+            fn_name = getattr(event, "name", "") or pending.get("name", "")
 
             try:
                 args = json.loads(args_str)
             except json.JSONDecodeError:
                 args = {"_raw": args_str}
 
-            state["completed_tool_calls"].append({
+            tc: ToolCall = {
                 "id": pending.get("call_id", item_id or ""),
-                "name": fn_name or pending.get("name", ""),
+                "name": fn_name,
                 "arguments": args,
-            })
+            }
+            state["completed_tool_calls"].append(tc)
+            emitted.append(self._event_builder.tool_call(tc))
             return emitted
 
         return emitted
@@ -1256,8 +1356,6 @@ class LLM:
             yield self._event_builder.answer(answer)
 
         completed_tool_calls = state["completed_tool_calls"]
-        for idx, tc in enumerate(completed_tool_calls):
-            yield self._event_builder.tool_call(tc, source=tc["name"], job=idx + 1)
 
         api_usage = state["api_usage"]
         stream_tokens = int(state["tokens"])
@@ -1532,7 +1630,7 @@ class LLM:
         )
 
         thinking_parser = ThinkingParser(self._config.custom_thinking_token)
-        tool_accumulator = ToolCallAccumulator()
+        tool_handler = ToolCallStreamHandler(self._event_builder)
 
         thinking = ""
         answer = ""
@@ -1602,9 +1700,9 @@ class LLM:
                         if not structured_output:
                             yield self._event_builder.answer(answer_part)
 
-                if tool_calls := getattr(delta, "tool_calls", None):
-                    for tc in tool_calls:
-                        tool_accumulator.add_chunk(tc)
+                tool_calls = getattr(delta, "tool_calls", None)
+                for event in tool_handler.process_chunk(tool_calls):
+                    yield event
         except Exception as e:
             raise ModelRequestError(f"Model stream failed: {e}") from e
 
@@ -1620,9 +1718,9 @@ class LLM:
                 pass
             yield self._event_builder.answer(answer)
 
-        final_tool_calls = tool_accumulator.get_completed_calls()
-        for idx, tc in enumerate(final_tool_calls):
-            yield self._event_builder.tool_call(tc, source=tc["name"], job=idx + 1)
+        final_tool_calls = tool_handler.finalize()
+        for tc in final_tool_calls:
+            yield self._event_builder.tool_call(tc)
 
         verbose_info: VerboseInfo = {
             "tokens": tokens,
@@ -1642,8 +1740,9 @@ class LLM:
             }
             if not hide_thinking and thinking.strip():
                 final_response["reasoning"] = thinking.strip()
-            if final_tool_calls:
-                final_response["tool_calls"] = final_tool_calls
+            all_completed_calls = tool_handler.get_all_calls()
+            if all_completed_calls:
+                final_response["tool_calls"] = all_completed_calls
             if verbose:
                 final_response["verbose"] = verbose_info
 
@@ -1733,7 +1832,7 @@ class LLM:
         )
 
         thinking_parser = ThinkingParser(self._config.custom_thinking_token)
-        tool_accumulator = ToolCallAccumulator()
+        tool_handler = ToolCallStreamHandler(self._event_builder)
 
         thinking = ""
         answer = ""
@@ -1805,9 +1904,9 @@ class LLM:
                         if not structured_output:
                             yield self._event_builder.answer(answer_part)
 
-                if tool_calls := getattr(delta, "tool_calls", None):
-                    for tc in tool_calls:
-                        tool_accumulator.add_chunk(tc)
+                tool_calls = getattr(delta, "tool_calls", None)
+                for event in tool_handler.process_chunk(tool_calls):
+                    yield event
         except Exception as e:
             raise ModelRequestError(f"Async model stream failed: {e}") from e
 
@@ -1823,9 +1922,9 @@ class LLM:
                 pass
             yield self._event_builder.answer(answer)
 
-        final_tool_calls = tool_accumulator.get_completed_calls()
-        for idx, tc in enumerate(final_tool_calls):
-            yield self._event_builder.tool_call(tc, source=tc["name"], job=idx + 1)
+        final_tool_calls = tool_handler.finalize()
+        for tc in final_tool_calls:
+            yield self._event_builder.tool_call(tc)
 
         verbose_info: VerboseInfo = {
             "tokens": tokens,
@@ -1845,8 +1944,10 @@ class LLM:
             }
             if not hide_thinking and thinking.strip():
                 final_response["reasoning"] = thinking.strip()
-            if final_tool_calls:
-                final_response["tool_calls"] = final_tool_calls
+            
+            all_completed_calls = tool_handler.get_all_calls()
+            if all_completed_calls:
+                final_response["tool_calls"] = all_completed_calls
             if verbose:
                 final_response["verbose"] = verbose_info
 
