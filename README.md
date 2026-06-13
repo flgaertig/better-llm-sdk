@@ -4,6 +4,8 @@ Small Python SDK for OpenAI-compatible LLM APIs.
 
 One file, clean API, boring on purpose. Use it with local servers, OpenAI-style endpoints, structured output, tool calls, vision inputs, and reasoning streams.
 
+<img width="1280" height="658" alt="llm-sdk" src="https://github.com/user-attachments/assets/a0b83acf-c65e-471e-ae2a-8a7bd2de8b39" />
+
 ## ✨ Features
 
 - Sync and async clients
