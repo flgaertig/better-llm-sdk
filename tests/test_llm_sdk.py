@@ -167,7 +167,7 @@ class LLMSDKTests(unittest.TestCase):
 
         self.assertEqual(
             tool_event["content"],
-            {"id": "call_1", "name": "weather", "arguments": {"city": "Berlin"}},
+            {"id": "call_1", "name": "weather", "arguments": {"city": "Berlin"}, "callable": None},
         )
         self.assertEqual(verbose_event["content"]["tokens"], 7)
         self.assertEqual(final_event["content"]["tool_calls"], [tool_event["content"]])
@@ -239,7 +239,8 @@ class LLMSDKTests(unittest.TestCase):
         self.assertEqual(events_4[0]["content"], {
             "id": "call_123",
             "name": "weather",
-            "arguments": {"city": "Berlin"}
+            "arguments": {"city": "Berlin"},
+            "callable": None
         })
 
         # Check get_all_calls
@@ -247,7 +248,8 @@ class LLMSDKTests(unittest.TestCase):
         self.assertEqual(all_calls, [{
             "id": "call_123",
             "name": "weather",
-            "arguments": {"city": "Berlin"}
+            "arguments": {"city": "Berlin"},
+            "callable": None
         }])
 
         # Test parallel tool calls with switching
@@ -290,6 +292,54 @@ class LLMSDKTests(unittest.TestCase):
         self.assertEqual(len(all_calls), 2)
         self.assertEqual(all_calls[0]["id"], "call_0")
         self.assertEqual(all_calls[1]["id"], "call_1")
+
+    def test_helper_functions(self):
+        from llm_sdk import user_message, tool_result, assistant_message
+
+        # Test user_message
+        self.assertEqual(
+            user_message("hello"),
+            {"role": "user", "content": "hello"}
+        )
+
+        # Test tool_result
+        self.assertEqual(
+            tool_result({"id": "call_123"}, "success"),
+            {"role": "tool", "tool_call_id": "call_123", "content": "success"}
+        )
+
+        # Test assistant_message with no tool calls
+        self.assertEqual(
+            assistant_message({"answer": "hello"}),
+            {"role": "assistant", "content": "hello", "tool_calls": None}
+        )
+
+        # Test assistant_message with tool calls (should serialize arguments)
+        final_resp = {
+            "answer": "checking",
+            "tool_calls": [
+                {
+                    "id": "call_abc",
+                    "name": "weather",
+                    "arguments": {"city": "Berlin"}
+                }
+            ]
+        }
+        expected = {
+            "role": "assistant",
+            "content": "checking",
+            "tool_calls": [
+                {
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": '{"city": "Berlin"}'
+                    }
+                }
+            ]
+        }
+        self.assertEqual(assistant_message(final_resp), expected)
 
 
 if __name__ == "__main__":

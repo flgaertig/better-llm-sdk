@@ -42,18 +42,17 @@ llm = LLM(
     api_key="lm-studio",
 )
 
-response = llm.response(input="Write a tiny haiku about fast code.")
+response = llm.response(input="Write a tiny haiku about fast code.",system="You're an helpful assistant!")
 
 print(response["answer"])
 ```
 
 By default, `base_url="http://localhost:1234/v1"` and `api_key="lm-studio"`, so local LM Studio-style servers work with very little setup.
 
-All inference methods accept either `input="..."` for the common single-user-message case or a Chat Completions-style message list:
+All inference methods accept either `input="..."` for the common single-user-message case or a Chat Completions-style message list + `system` for a system prompt:
 
 ```python
 response = llm.response(messages=[
-    {"role": "system", "content": "Be concise."},
     {"role": "user", "content": "Write a tiny haiku about fast code."},
 ])
 ```
@@ -71,7 +70,7 @@ Events are small dictionaries:
 ```python
 {"type": "answer", "content": "..."}
 {"type": "reasoning", "content": "..."}
-{"type": "tool_call", "content": {"id": "...", "name": "...", "arguments": {...}}}
+{"type": "tool_call", "content": {"id": "...", "name": "...", "arguments": {...}, "callable": Callable}}
 {"type": "tool_call_part", "content": {"id": "...", "name": "...", "args_delta": {...}}}
 {"type": "verbose", "content": {"tokens": 42, "tokens_per_second": 91.3, "latency": 0.2, "prompt_tokens": 10, "completion_tokens": 32, "total_tokens": 42}}
 {"type": "final", "content": {"answer": "..."}}
@@ -141,6 +140,22 @@ response = llm.response(
 print(response.get("tool_calls", []))
 ```
 
+For multi-turn conversation loops with tool calls, use the built-in helper functions to easily format messages:
+
+```python
+from llm_sdk import assistant_message, tool_result, user_message
+
+# 1. Format the assistant's response (includes both answer text and tool calls)
+msg1 = assistant_message(response)
+
+# 2. Format a tool call execution result
+msg2 = tool_result(response["tool_calls"][0], "result string or dict")
+
+# 3. Format subsequent user messages
+msg3 = user_message("Tell me more about the results.")
+```
+
+
 ## 👁️ Vision
 
 Image content can be a URL, a local path, base64, or a PIL image.
@@ -193,7 +208,7 @@ response = llm.response(
 - `response(...)` and `stream_response(...)`
 - `async_response(...)` and `async_stream_response(...)`
 - `input="..."` or `messages=[...]` for all inference methods
-- `list_models(fallback=[...])` and `async_list_models(fallback=[...])`
+- `list_models(...)` and `async_list_models(...)`
 - `max_retries=3` globally on `LLM(...)` or per call
 - `reasoning_effort="low|medium|high"` where supported
 - `hide_thinking=False` to stream/return reasoning content

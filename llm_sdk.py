@@ -71,8 +71,6 @@ DEFAULT_BASE_URL: Final[str] = "http://localhost:1234/v1"
 DEFAULT_TIMEOUT: Final[float] = 300.0
 
 MessageList = List[Dict[str, Any]]
-InputValue = Union[str, MessageList]
-
 
 def _close_async_resource(resource: Any) -> None:
     if not hasattr(resource, "close"):
@@ -122,22 +120,29 @@ def _deep_merge_dicts(
 
 
 def _resolve_messages(
-    messages: Optional[InputValue] = None,
-    input: Optional[InputValue] = None,
+    messages: Optional[list] = None,
+    input: Optional[str] = None,
+    system: Optional[str] = None,
 ) -> MessageList:
-    provided = [value is not None for value in (messages, input)].count(True)
-    if provided != 1:
-        raise ValueError("Provide exactly one of messages or input")
-
-    value = input if input is not None else messages
-    if isinstance(value, str):
-        return [{"role": "user", "content": value}]
-    if isinstance(value, list):
-        for idx, message in enumerate(value):
-            if not isinstance(message, dict):
-                raise ValueError(f"Message at index {idx} must be a dict")
-        return copy.deepcopy(value)
-    raise ValueError("input must be a string or a list of messages")
+    if system:
+        if not isinstance(system, str):
+            raise ValueError("system must be a string")
+    if messages is not None and input is not None:
+        raise ValueError("Cannot specify both 'messages' and 'input'")
+    elif messages is not None and system is not None:
+        return [({"role": "system", "content": system})] + messages
+    elif messages is not None:
+        if not isinstance(messages, list):
+            raise ValueError("messages must be a list of dicts")
+        return messages
+    elif input is not None and system is not None:
+        return [{"role": "system", "content": system}, {"role": "user", "content": input}]
+    elif input is not None:
+        if not isinstance(input, str):
+            raise ValueError("input must be a string")
+        return [{"role": "user", "content": input}]
+    else:
+        raise ValueError("Must specify either 'messages' or 'input'")
 
 # ============================================================================
 # Enums
@@ -182,8 +187,27 @@ class ToolCall(TypedDict):
     id: str
     name: str
     arguments: Dict[str, Any]
-
-
+    callable: Optional[Callable]
+    
+class ToolCallMessage(TypedDict):
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+    
+class ToolResultMessage(TypedDict):
+    role: str
+    tool_call_id: str
+    content: Dict[str, Any] | str
+    
+class AssistantMessage(TypedDict):
+    role: str
+    content: Any
+    tool_calls: Optional[List[Dict[str, Any]]]
+    
+class UserMessage(TypedDict):
+    role: str
+    content: str | List[Dict[str, Any]]
+    
 class VerboseInfo(TypedDict):
     """Typed dictionary for verbose information."""
     tokens: int
@@ -531,7 +555,6 @@ class PreparedTools:
     """Result of tool preparation."""
     definitions: List[Dict[str, Any]]
 
-
 class ToolPreparator:
     """Prepares tools for LLM consumption."""
 
@@ -639,7 +662,41 @@ class ToolPreparator:
             raise ConfigurationError(
                 f"Tool at index {index} missing 'name' in function definition"
             )
+    
+def tool_result(tool_call: ToolCall, result: Any) -> ToolResultMessage:
+    """Format a tool call result for LLM consumption."""
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "content": result
+    }
+    
+def assistant_message(final_response: FinalResponse) -> AssistantMessage:
+    """Format an assistant message with tool calls for LLM consumption."""
+    tool_calls = []
+    for tc in final_response.get("tool_calls", []):
+        args_val = tc.get("arguments", {})
+        args_str = json.dumps(args_val) if isinstance(args_val, (dict, list)) else (args_val or "{}")
+        tool_calls.append({
+            "id": tc.get("id", ""),
+            "type": "function",
+            "function": {
+                "name": tc.get("name", ""),
+                "arguments": args_str
+            }
+        })
+    return {
+        "role": "assistant",
+        "content": final_response.get("answer"),
+        "tool_calls": tool_calls if tool_calls else None
+    }
 
+def user_message(content: str | List[Dict[str, Any]]) -> UserMessage:
+    """Format a user message for LLM consumption."""
+    return {
+        "role": "user",
+        "content": content
+    }
 
 class RequestTransformer:
     """Provider/model-specific request normalizer."""
@@ -819,8 +876,9 @@ class EventBuilder:
 class ToolCallStreamHandler:
     """Accumulates tool calls AND emits incremental tool_call_part events."""
 
-    def __init__(self, event_builder: EventBuilder):
+    def __init__(self, event_builder: EventBuilder, tools_dict: Dict[str, Callable] = {}):
         self._event_builder = event_builder
+        self._tools_dict = tools_dict
         self._pending: Dict[int, Dict[str, Any]] = {}
         self._active_index: Optional[int] = None
         self._emitted_indices: Set[int] = set()
@@ -901,6 +959,7 @@ class ToolCallStreamHandler:
             "id": p["id"],
             "name": p["name"],
             "arguments": args,
+            "callable": self._tools_dict.get(p["name"]) or None,
         })
 
     def finalize(self) -> List[ToolCall]:
@@ -930,6 +989,7 @@ class ToolCallStreamHandler:
                 "id": p["id"],
                 "name": p["name"],
                 "arguments": args,
+                "callable": self._tools_dict.get(p["name"]) or None,
             })
         return result
 
@@ -1092,6 +1152,17 @@ class LLM:
 
         return self._request_transformer.transform(kwargs), prepared_tools, structured_output
 
+    def _build_tools_dict(self, tools: list) -> Dict[str, Callable]:
+        result = {}
+        for tool in tools:
+            if isinstance(tool, dict):
+                continue
+            underlying = ToolPreparator._unwrap_callable(tool)
+            name = getattr(tool, '__name__', None) or getattr(underlying, '__name__', None)
+            if name:
+                result[name] = tool
+        return result
+
     @staticmethod
     def _extract_reasoning(delta: Any) -> str:
         """Return streamed reasoning content from supported delta fields."""
@@ -1219,6 +1290,7 @@ class LLM:
         state: Dict[str, Any],
         structured_output: bool,
         hide_thinking: bool,
+        tools_dict: Dict[str,Callable],
     ) -> List[StreamEvent]:
         state["tokens"] += 1
         emitted: List[StreamEvent] = []
@@ -1330,6 +1402,7 @@ class LLM:
                 "id": pending.get("call_id", item_id or ""),
                 "name": fn_name,
                 "arguments": args,
+                "callable": tools_dict.get(fn_name) or None,
             }
             state["completed_tool_calls"].append(tc)
             emitted.append(self._event_builder.tool_call(tc))
@@ -1470,6 +1543,7 @@ class LLM:
         kwargs, _, structured_output = self._build_responses_request(
             messages, output_format, tools, reasoning_effort, max_tokens, extra_body
         )
+        tools_dict = self._build_tools_dict(tools or [])
 
         state = self._new_responses_state()
         start_time = time.perf_counter()
@@ -1487,7 +1561,7 @@ class LLM:
                 if latency is None:
                     latency = time.perf_counter() - start_time
                 for emitted in self._handle_responses_event(
-                    event, state, structured_output, hide_thinking
+                    event, state, structured_output, hide_thinking,tools_dict
                 ):
                     yield emitted
 
@@ -1519,6 +1593,7 @@ class LLM:
         kwargs, _, structured_output = self._build_responses_request(
             messages, output_format, tools, reasoning_effort, max_tokens, extra_body
         )
+        tools_dict = self._build_tools_dict(tools or [])
 
         state = self._new_responses_state()
         start_time = time.perf_counter()
@@ -1540,7 +1615,7 @@ class LLM:
                 if latency is None:
                     latency = time.perf_counter() - start_time
                 for emitted in self._handle_responses_event(
-                    event, state, structured_output, hide_thinking
+                    event, state, structured_output, hide_thinking,tools_dict
                 ):
                     yield emitted
 
@@ -1555,7 +1630,7 @@ class LLM:
 
     def response(
         self,
-        messages: Optional[InputValue] = None,
+        messages: Optional[List[Dict]] = None,
         output_format: Union[Dict, type, None] = None,
         tools: Optional[List] = None,
         verbose: bool = False,
@@ -1563,11 +1638,12 @@ class LLM:
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
-        input: Optional[InputValue] = None,
+        input: Optional[str] = None,
+        system: Optional[str] = None,
         max_retries: Optional[int] = None,
     ) -> FinalResponse:
         """Request model inference (non-streaming)."""
-        resolved_messages = _resolve_messages(messages, input)
+        resolved_messages = _resolve_messages(messages, input,system)
         output_format = self._prepare_output_format(output_format)
 
         final_content = None
@@ -1595,7 +1671,7 @@ class LLM:
 
     def stream_response(
         self,
-        messages: Optional[InputValue] = None,
+        messages: Optional[List[Dict]] = None,
         output_format: Union[Dict, type, None] = None,
         final: bool = False,
         tools: Optional[List] = None,
@@ -1605,10 +1681,11 @@ class LLM:
         verbose: bool = False,
         extra_body: Optional[Dict] = None,
         max_retries: Optional[int] = None,
-        input: Optional[InputValue] = None,
+        input: Optional[str] = None,
+        system: Optional[str] = None,
     ) -> Generator[StreamEvent, None, None]:
         """Request model inference with streaming."""
-        resolved_messages = _resolve_messages(messages, input)
+        resolved_messages = _resolve_messages(messages, input, system)
         output_format = self._prepare_output_format(output_format)
         if self._config.use_responses_api:
             yield from self._stream_responses_sync(
@@ -1628,9 +1705,9 @@ class LLM:
         kwargs, _, structured_output = self._build_request(
             resolved_messages, output_format, tools, reasoning_effort, max_tokens, extra_body
         )
-
+        
         thinking_parser = ThinkingParser(self._config.custom_thinking_token)
-        tool_handler = ToolCallStreamHandler(self._event_builder)
+        tool_handler = ToolCallStreamHandler(self._event_builder,self._build_tools_dict(tools or []))
 
         thinking = ""
         answer = ""
@@ -1756,7 +1833,7 @@ class LLM:
 
     async def async_response(
         self,
-        messages: Optional[InputValue] = None,
+        messages: Optional[List[Dict]] = None,
         output_format: Union[Dict, type, None] = None,
         tools: Optional[List] = None,
         verbose: bool = False,
@@ -1764,11 +1841,12 @@ class LLM:
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
-        input: Optional[InputValue] = None,
+        input: Optional[str] = None,
+        system: Optional[str] = None,
         max_retries: Optional[int] = None,
     ) -> FinalResponse:
         """Async request for model inference."""
-        resolved_messages = _resolve_messages(messages, input)
+        resolved_messages = _resolve_messages(messages, input, system)
         output_format = self._prepare_output_format(output_format)
 
         final_content = None
@@ -1795,7 +1873,7 @@ class LLM:
 
     async def async_stream_response(
         self,
-        messages: Optional[InputValue] = None,
+        messages: Optional[List[Dict]] = None,
         output_format: Union[Dict, type, None] = None,
         final: bool = False,
         tools: Optional[List] = None,
@@ -1804,12 +1882,13 @@ class LLM:
         reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         extra_body: Optional[Dict] = None,
-        input: Optional[InputValue] = None,
+        input: Optional[str] = None,
+        system: Optional[str] = None,
         max_retries: Optional[int] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Async streaming model inference."""
 
-        resolved_messages = _resolve_messages(messages, input)
+        resolved_messages = _resolve_messages(messages, input, system)
         output_format = self._prepare_output_format(output_format)
         if self._config.use_responses_api:
             async for event in self._stream_responses_async(
@@ -1832,7 +1911,7 @@ class LLM:
         )
 
         thinking_parser = ThinkingParser(self._config.custom_thinking_token)
-        tool_handler = ToolCallStreamHandler(self._event_builder)
+        tool_handler = ToolCallStreamHandler(self._event_builder, self._build_tools_dict(tools or []))
 
         thinking = ""
         answer = ""
@@ -1984,6 +2063,79 @@ class LLM:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.aclose()
         return False
+    
+def list_models(
+    fallback: Optional[List[str]] = None,
+    max_retries: int = 3,
+    client: Optional[LLM] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> List[str]:
+    """Return model IDs from the configured API, or fallback/[] on failure."""
+    a_k = ""
+    b_u = ""
+    manually = base_url is not None or api_key is not None
+    if client and not manually:
+        a_k = client._client.api_key
+        b_u = client._api_base
+    elif manually and not client:
+        if not (base_url and api_key):
+            raise ValueError("If client is not provided, both api_key and base_url must be provided.")
+        a_k = api_key
+        b_u = base_url
+    elif not manually and not client:
+        raise ValueError("Either a client must be provided, or both api_key and base_url must be provided.")
+    elif client and manually:
+        if base_url is not None and base_url != client._api_base:
+            raise ValueError("If client is provided, base_url must match the client's configuration or be None.")
+        if api_key is not None and api_key != client._client.api_key:
+            raise ValueError("If client is provided, api_key must match the client's configuration or be None.")
+        a_k = client._client.api_key
+        b_u = client._api_base
+    try:
+        c = OpenAI(api_key=a_k, base_url=b_u,max_retries=max_retries)
+        models = c.models.list()
+        return sorted({model.id for model in models.data}) or list(fallback or [])
+    except Exception:
+        return list(fallback or [])
+        
+        
+async def async_list_models(
+    fallback: Optional[List[str]] = None,
+    max_retries: int = 3,
+    client: Optional[LLM] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> List[str]:
+    """Async version of list_models."""
+    a_k = ""
+    b_u = ""
+    manually = base_url is not None or api_key is not None
+    if client and not manually:
+        a_k = client._client.api_key
+        b_u = client._api_base
+    elif manually and not client:
+        if not (base_url and api_key):
+            raise ValueError("If client is not provided, both api_key and base_url must be provided.")
+        a_k = api_key
+        b_u = base_url
+    elif not manually and not client:
+        raise ValueError("Either a client must be provided, or both api_key and base_url must be provided.")
+    elif client and manually:
+        if base_url is not None and base_url != client._api_base:
+            raise ValueError("If client is provided, base_url must match the client's configuration or be None.")
+        if api_key is not None and api_key != client._client.api_key:
+            raise ValueError("If client is provided, api_key must match the client's configuration or be None.")
+        a_k = client._client.api_key
+        b_u = client._api_base
+    try:
+        c = AsyncOpenAI(api_key=a_k, base_url=b_u,max_retries=max_retries)
+        models = await c.models.list()
+        return sorted({model.id for model in models.data}) or list(fallback or [])
+    except Exception:
+        return list(fallback or [])
+        
+        
 
 # ============================================================================
 # Public API
@@ -1995,6 +2147,13 @@ __all__ = [
     "CustomThinkingToken",
     "StreamEvent",
     "ToolCall",
+    "ToolCallMessage",
+    "ToolResultMessage",
+    "UserMessage",
+    "AssistantMessage",
+    "assistant_message",
+    "user_message",
+    "tool_result",
     "FinalResponse",
     "VerboseInfo",
     "EventType",
@@ -2002,4 +2161,6 @@ __all__ = [
     "ConfigurationError",
     "SchemaConversionError",
     "ModelRequestError",
+    "list_models",
+    "async_list_models",
 ]
