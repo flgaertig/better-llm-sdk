@@ -220,6 +220,8 @@ response = llm.response(
 
 Most LLM wrappers either become frameworks or stay too close to raw HTTP. This sits in the middle: enough structure to be pleasant, little enough surface area to understand in one sitting.
 
+If this saves you time, please ⭐ the repo! Thanks! ♥️
+
 ## 📜 License
 
 MIT
