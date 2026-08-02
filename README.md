@@ -44,7 +44,7 @@ llm = LLM(
     api_key="lm-studio",
 )
 
-response = llm.response(input="Write a tiny haiku about fast code.",system="You're an helpful assistant!")
+response = llm.response(system="You're an helpful assistant!",input="Write a tiny haiku about fast code.")
 
 print(response["answer"])
 ```
