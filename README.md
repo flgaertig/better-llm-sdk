@@ -168,7 +168,7 @@ response = llm.response([
         "role": "user",
         "content": [
             {"type": "text", "text": "What is in this image?"},
-            {"type": "image_path", "image_path": "photo.png"},
+            {"type": "image", "image_path": "photo.png"},
         ],
     }
 ])
@@ -176,10 +176,10 @@ response = llm.response([
 
 Supported image forms include:
 
-- `{"type": "image_url", "image_url": "https://..."}`
-- `{"type": "image_path", "image_path": "local-file.png"}`
-- `{"type": "image_base64", "image_base64": "..."}`
-- `{"type": "image_pil", "image_pil": image}`
+- `{"type": "image", "image_url": "https://..."}`
+- `{"type": "image", "image_path": "local-file.png"}`
+- `{"type": "image", "image_base64": "..."}`
+- `{"type": "image", "image_pil": image}`
 
 ## 🔌 Responses API
 
