@@ -44,7 +44,7 @@ llm = LLM(
     api_key="lm-studio",
 )
 
-response = llm.response(system="You're an helpful assistant!",input="Write a tiny haiku about fast code.")
+response = llm.response(system="You're a helpful assistant!",input="Write a tiny haiku about fast code.")
 
 print(response["answer"])
 ```
@@ -73,9 +73,9 @@ Events are small dictionaries:
 {"type": "answer", "content": "..."}
 {"type": "reasoning", "content": "..."}
 {"type": "tool_call", "content": {"id": "...", "name": "...", "arguments": {...}, "callable": Callable}}
-{"type": "tool_call_part", "content": {"id": "...", "name": "...", "args_delta": {...}}}
-{"type": "verbose", "content": {"tokens": 42, "tokens_per_second": 91.3, "latency": 0.2, "prompt_tokens": 10, "completion_tokens": 32, "total_tokens": 42}}
-{"type": "final", "content": {"answer": "..."}}
+{"type": "tool_call_part", "content": {"id": "...", "name": "...", "args_delta": "{\"city\": \"Berlin\"}"}}
+{"type": "verbose", "content": {"tokens": 42, "tokens_per_second": 91.3, "latency": 0.2, "prompt_tokens": 10, "completion_tokens": 32, "total_tokens": 42, "stop_reason": "stop"}}
+{"type": "final", "content": {"answer": "...", "stop_reason": "stop"}}
 {"type": "done"}
 ```
 
@@ -107,7 +107,7 @@ llm.response(input="...", max_retries=0)
 
 ## 📐 Structured Output
 
-Pass a JSON schema or a typed class. Classes are converted into OpenAI-compatible JSON schema.
+Pass a JSON schema or a typed class. Classes are converted into OpenAI-compatible JSON schema (including enums, literals, and optional fields).
 
 ```python
 class Verdict:
@@ -145,7 +145,10 @@ print(response.get("tool_calls", []))
 For multi-turn conversation loops with tool calls, use the built-in helper functions to easily format messages:
 
 ```python
-from llm_sdk import assistant_message, tool_result, user_message
+from llm_sdk import assistant_message, system_message, tool_result, user_message
+
+# 0. Optional system message
+msg0 = system_message("You are a helpful assistant.")
 
 # 1. Format the assistant's response (includes both answer text and tool calls)
 msg1 = assistant_message(response)
@@ -178,7 +181,7 @@ Supported image forms include:
 
 - `{"type": "image", "image_url": "https://..."}`
 - `{"type": "image", "image_path": "local-file.png"}`
-- `{"type": "image", "image_base64": "..."}`
+- `{"type": "image", "image_base64": "..."}` (MIME type auto-detected from the bytes)
 - `{"type": "image", "image_pil": image}`
 
 ## 🔌 Responses API
@@ -196,7 +199,7 @@ llm = LLM(
 
 ## 🧠 Reasoning Effort
 
-Use `reasoning_effort="high"` to set models's reasoning effort.
+Use `reasoning_effort="high"` to set the model's reasoning effort.
 
 ```python
 response = llm.response(
@@ -210,13 +213,16 @@ response = llm.response(
 - `response(...)` and `stream_response(...)`
 - `async_response(...)` and `async_stream_response(...)`
 - `input="..."` or `messages=[...]` for all inference methods
-- `list_models(...)` and `async_list_models(...)`
+- `LLM.list_models(...)` / `LLM.async_list_models(...)` and standalone `list_models(...)` / `async_list_models(...)`
 - `max_retries=3` globally on `LLM(...)` or per call
 - `reasoning_effort="low|medium|high"` where supported
 - `hide_thinking=False` to stream/return reasoning content
 - `CustomThinkingToken(...)` for custom `<think>`-style parsing
-- `verbose=True` for token-ish stream stats
+- `verbose=True` for token-ish stream stats (incl. `stop_reason`)
+- `stop_reason` in final responses: `"stop" | "length" | "tool_calls" | "content_filter"` (and `"failed"`/`"cancelled"`/`"incomplete"` from the Responses API)
+- message helpers: `system_message(...)`, `user_message(...)`, `assistant_message(...)`, `tool_result(...)`
 - `with LLM(...) as llm:` / `async with LLM(...) as llm:` for cleanup
+- `from llm_sdk import __version__` for the package version
 
 ## 💡 Why
 

@@ -10,48 +10,44 @@ Features:
 
 from __future__ import annotations
 
-import json
-import base64
-import re
-import io
-import time
-import sys
-import inspect
-import logging
-import copy
 import asyncio
-import threading
+import base64
+import copy
 import functools
+import inspect
+import io
+import json
+import logging
+import re
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from types import UnionType
 from typing import (
-    Any, AsyncGenerator, Dict, Optional, List, Generator,
-    Callable, Union, get_type_hints, get_origin, get_args,
-    Literal, TypedDict, TypeVar, Final, ClassVar, Set,
-    TYPE_CHECKING
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Callable,
+    ClassVar,
+    Dict,
+    Final,
+    Generator,
+    List,
+    Literal,
+    Optional,
+    Set,
+    TypedDict,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
 )
 
-from openai import OpenAI, AsyncOpenAI, APIStatusError
+from openai import APIStatusError, AsyncOpenAI, OpenAI
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
-
-# ============================================================================
-# Version Compatibility
-# ============================================================================
-
-if sys.version_info < (3, 10):
-    _DEFAULT = object()
-
-    async def anext(async_iterator, default=_DEFAULT):
-        """Polyfill for anext() in Python < 3.10."""
-        try:
-            return await async_iterator.__anext__()
-        except StopAsyncIteration:
-            if default is _DEFAULT:
-                raise
-            return default
 
 # ============================================================================
 # Logging Configuration
@@ -69,37 +65,33 @@ for _logger_name in ("httpx", "openai", "httpcore"):
 DEFAULT_API_KEY: Final[str] = "lm-studio"
 DEFAULT_BASE_URL: Final[str] = "http://localhost:1234/v1"
 DEFAULT_TIMEOUT: Final[float] = 300.0
+__version__: Final[str] = "1.5.0"
 
 MessageList = List[Dict[str, Any]]
 
-def _close_async_resource(resource: Any) -> None:
-    if not hasattr(resource, "close"):
+async def _aclose_async_resource(resource: Any) -> None:
+    """Close an async resource from within a running event loop."""
+    close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+    if close is None:
         return
+    close_result = close()
+    if inspect.isawaitable(close_result):
+        await close_result
 
-    async def _close() -> None:
-        close_result = resource.close()
-        if inspect.isawaitable(close_result):
-            await close_result
 
+def _close_async_resource(resource: Any) -> None:
+    """Close an async resource from sync code (no event loop running)."""
+    if not hasattr(resource, "aclose") and not hasattr(resource, "close"):
+        return
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        asyncio.run(_close())
+        asyncio.run(_aclose_async_resource(resource))
         return
-
-    error_box: List[BaseException] = []
-
-    def _runner() -> None:
-        try:
-            asyncio.run(_close())
-        except BaseException as exc:  # pragma: no cover - defensive cleanup path
-            error_box.append(exc)
-
-    worker = threading.Thread(target=_runner, daemon=True, name="llm-close")
-    worker.start()
-    worker.join()
-    if error_box:
-        raise error_box[0]
+    raise RuntimeError(
+        "Cannot close an async resource while an event loop is running; "
+        "use `await LLM.aclose()` instead"
+    )
 
 
 def _deep_merge_dicts(
@@ -124,12 +116,13 @@ def _resolve_messages(
     input: Optional[str] = None,
     system: Optional[str] = None,
 ) -> MessageList:
-    if system:
-        if not isinstance(system, str):
-            raise ValueError("system must be a string")
+    if system and not isinstance(system, str):
+        raise ValueError("system must be a string")
     if messages is not None and input is not None:
         raise ValueError("Cannot specify both 'messages' and 'input'")
     elif messages is not None and system is not None:
+        if not isinstance(messages, list):
+            raise ValueError("messages must be a list of dicts")
         return [({"role": "system", "content": system})] + messages
     elif messages is not None:
         if not isinstance(messages, list):
@@ -176,9 +169,6 @@ class SchemaType(str, Enum):
 # Type Definitions
 # ============================================================================
 
-T = TypeVar('T')
-
-
 class StreamEvent(TypedDict, total=False):
     type: str
     content: Any
@@ -188,27 +178,27 @@ class ToolCall(TypedDict):
     name: str
     arguments: Dict[str, Any]
     callable: Optional[Callable]
-    
+
 class ToolCallMessage(TypedDict):
     id: str
     name: str
     arguments: Dict[str, Any]
-    
+
 class ToolResultMessage(TypedDict):
     role: str
     tool_call_id: str
     content: Dict[str, Any] | str
-    
+
 class AssistantMessage(TypedDict):
     role: str
     content: Any
     tool_calls: Optional[List[Dict[str, Any]]]
-    
+
 class UserMessage(TypedDict):
     role: str
     content: str | List[Dict[str, Any]]
-    
-class VerboseInfo(TypedDict):
+
+class VerboseInfo(TypedDict, total=False):
     """Typed dictionary for verbose information."""
     tokens: int
     tokens_per_second: float
@@ -216,6 +206,7 @@ class VerboseInfo(TypedDict):
     prompt_tokens: Optional[int]
     completion_tokens: Optional[int]
     total_tokens: Optional[int]
+    stop_reason: Optional[str]
 
 
 class FinalResponse(TypedDict, total=False):
@@ -224,6 +215,7 @@ class FinalResponse(TypedDict, total=False):
     reasoning: str
     tool_calls: List[ToolCall]
     verbose: VerboseInfo
+    stop_reason: Optional[str]
 
 # ============================================================================
 # Exceptions
@@ -391,6 +383,15 @@ class SchemaConverter:
     _LLM_SUPPORTED_TYPES: ClassVar[frozenset] = frozenset({str, int, float, bool, list, dict})
 
     @staticmethod
+    def _is_union_type(python_type: Any) -> bool:
+        return get_origin(python_type) in (Union, UnionType)
+
+    @classmethod
+    def is_optional_type(cls, python_type: Any) -> bool:
+        """Return whether an annotation is a union that includes None."""
+        return cls._is_union_type(python_type) and type(None) in get_args(python_type)
+
+    @staticmethod
     def _ordered_object_schema(
         required: Optional[List[str]] = None,
         properties: Optional[Dict[str, Any]] = None,
@@ -431,7 +432,7 @@ class SchemaConverter:
                 schema["additionalProperties"] = self.python_type_to_json_schema(args[1], seen_models)
             return schema
 
-        if origin is Union:
+        if self._is_union_type(python_type):
             non_none_types = [t for t in args if t is not type(None)]
             if len(non_none_types) == 1:
                 return {
@@ -446,6 +447,9 @@ class SchemaConverter:
 
         if origin is Literal:
             return {"enum": list(args)}
+
+        if isinstance(python_type, type) and issubclass(python_type, Enum):
+            return {"enum": [member.value for member in python_type]}
 
         if self._is_annotated_class(python_type):
             if python_type in seen_models:
@@ -474,6 +478,12 @@ class SchemaConverter:
         if python_type is None or python_type is type(None):
             return True
 
+        if python_type is Any:
+            return True
+
+        if isinstance(python_type, type) and issubclass(python_type, Enum):
+            return True
+
         origin = get_origin(python_type)
         args = get_args(python_type)
 
@@ -481,7 +491,7 @@ class SchemaConverter:
             return not args or self.is_llm_supported_type(args[0])
         if origin is dict:
             return len(args) != 2 or self.is_llm_supported_type(args[1])
-        if origin is Union:
+        if self._is_union_type(python_type):
             non_none = [t for t in args if t is not type(None)]
             return all(self.is_llm_supported_type(t) for t in non_none)
         if origin is Literal:
@@ -507,6 +517,12 @@ class SchemaConverter:
 
         try:
             hints = get_type_hints(schema_class)
+        except Exception as e:
+            raise SchemaConversionError(
+                f"Could not resolve type hints for class {schema_class.__name__}: {e}"
+            ) from e
+
+        try:
             properties = {}
             required = []
 
@@ -518,10 +534,7 @@ class SchemaConverter:
             for field_name, field_type in hints.items():
                 properties[field_name] = self.python_type_to_json_schema(field_type, seen_models)
 
-                is_optional = (
-                    get_origin(field_type) is Union
-                    and type(None) in get_args(field_type)
-                )
+                is_optional = self.is_optional_type(field_type)
 
                 if field_name not in class_defaults and not is_optional:
                     required.append(field_name)
@@ -588,9 +601,16 @@ class ToolPreparator:
         name = (getattr(func, '__name__', None) or underlying.__name__).strip()
         doc = (getattr(underlying, '__doc__', None) or getattr(func, '__doc__', None) or "").strip()
 
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+            raise ConfigurationError(
+                f"Tool name {name!r} is not a valid OpenAI tool name; "
+                "use a named function or functools.partial"
+            )
+
         try:
             annotations = get_type_hints(underlying)
-        except Exception:
+        except Exception as e:
+            logger.debug("Could not resolve type hints for %r, using raw annotations: %s", name, e)
             annotations = getattr(underlying, "__annotations__", {})
 
         sig = inspect.signature(func)
@@ -600,6 +620,8 @@ class ToolPreparator:
 
         for param_name, param in sig.parameters.items():
             if param_name == "return":
+                continue
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
                 continue
 
             param_type = annotations.get(param_name)
@@ -619,7 +641,7 @@ class ToolPreparator:
                     f"{existing} (Default: {default_repr})" if existing
                     else f"Default: {default_repr}"
                 )
-            else:
+            elif not (param_type and self._converter.is_optional_type(param_type)):
                 required.append(param_name)
 
             parameters[param_name] = param_schema
@@ -662,15 +684,17 @@ class ToolPreparator:
             raise ConfigurationError(
                 f"Tool at index {index} missing 'name' in function definition"
             )
-    
+
 def tool_result(tool_call: ToolCall, result: Any) -> ToolResultMessage:
     """Format a tool call result for LLM consumption."""
+    if isinstance(result, (dict, list)):
+        result = json.dumps(result)
     return {
         "role": "tool",
         "tool_call_id": tool_call["id"],
         "content": result
     }
-    
+
 def assistant_message(final_response: FinalResponse) -> AssistantMessage:
     """Format an assistant message with tool calls for LLM consumption."""
     tool_calls = []
@@ -685,9 +709,12 @@ def assistant_message(final_response: FinalResponse) -> AssistantMessage:
                 "arguments": args_str
             }
         })
+    answer = final_response.get("answer")
+    if isinstance(answer, (dict, list)):
+        answer = json.dumps(answer)
     return {
         "role": "assistant",
-        "content": final_response.get("answer"),
+        "content": answer,
         "tool_calls": tool_calls if tool_calls else None
     }
 
@@ -695,6 +722,13 @@ def user_message(content: str | List[Dict[str, Any]]) -> UserMessage:
     """Format a user message for LLM consumption."""
     return {
         "role": "user",
+        "content": content
+    }
+
+def system_message(content: str) -> Dict[str, str]:
+    """Format a system message for LLM consumption."""
+    return {
+        "role": "system",
         "content": content
     }
 
@@ -765,7 +799,7 @@ class ImageProcessor:
                 from PIL import Image
                 cls._pil_image = Image
             except ImportError:
-                raise ImportError("PIL/Pillow required. Install with: pip install Pillow")
+                raise ImportError("PIL/Pillow required. Install with: pip install Pillow") from None
         return cls._pil_image
 
     @staticmethod
@@ -798,7 +832,7 @@ class ImageProcessor:
             with Image.open(path) as img:
                 return ImageProcessor._encode_pil_image(img)
         except Exception as e:
-            raise ValueError(f"Failed to process image from path '{path}': {e}")
+            raise ValueError(f"Failed to process image from path '{path}': {e}") from e
 
     @staticmethod
     def _from_pil(img: "PILImage") -> Dict:
@@ -814,8 +848,26 @@ class ImageProcessor:
     def _from_base64(data: str) -> Dict:
         return {
             "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{data}"}
+            "image_url": {"url": f"data:{ImageProcessor._sniff_image_mime(data)};base64,{data}"}
         }
+
+    @staticmethod
+    def _sniff_image_mime(data: str) -> str:
+        try:
+            raw = base64.b64decode(data, validate=True)[:16]
+        except Exception:
+            return "image/png"
+        if raw.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+            return "image/webp"
+        if raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
+            return "image/gif"
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if raw.startswith(b"BM"):
+            return "image/bmp"
+        return "image/png"
 
     @staticmethod
     def _encode_pil_image(img: "PILImage") -> Dict:
@@ -876,46 +928,103 @@ class EventBuilder:
 class ToolCallStreamHandler:
     """Accumulates tool calls AND emits incremental tool_call_part events."""
 
-    def __init__(self, event_builder: EventBuilder, tools_dict: Dict[str, Callable] = {}):
+    def __init__(self, event_builder: EventBuilder, tools_dict: Optional[Dict[str, Callable]] = None):
         self._event_builder = event_builder
-        self._tools_dict = tools_dict
-        self._pending: Dict[int, Dict[str, Any]] = {}
-        self._active_index: Optional[int] = None
-        self._emitted_indices: Set[int] = set()
+        self._tools_dict = tools_dict or {}
+        self._pending: Dict[Any, Dict[str, Any]] = {}
+        self._active_key: Optional[Any] = None
+        self._emitted_keys: Set[Any] = set()
+        self._id_to_key: Dict[str, Any] = {}
+        self._next_fallback_index = 0
+
+    def _resolve_key(self, tc: Any) -> tuple[Any, bool]:
+        """Resolve a stable key for a streamed tool call.
+
+        Some OpenAI-compatible servers omit ``index``. An id, when present,
+        is the only reliable identity in that case. A missing id can still be
+        associated with the active call until a later chunk supplies it.
+        """
+        idx = getattr(tc, "index", None)
+        tid = getattr(tc, "id", None)
+
+        if idx is not None:
+            key = ("index", idx)
+            if tid:
+                self._id_to_key[tid] = key
+            return key, True
+
+        if tid:
+            if tid in self._id_to_key:
+                return self._id_to_key[tid], False
+            if (
+                self._active_key is not None
+                and self._active_key in self._pending
+                and not self._pending[self._active_key]["id"]
+                and self._active_key not in self._emitted_keys
+            ):
+                self._id_to_key[tid] = self._active_key
+                return self._active_key, False
+            key = ("id", tid)
+            self._id_to_key[tid] = key
+            return key, False
+
+        if self._active_key is not None and self._active_key in self._pending:
+            active = self._pending[self._active_key]
+            function = getattr(tc, "function", None)
+            incoming_name = getattr(function, "name", None) if function is not None else None
+            if incoming_name and active["name"] and active["arguments"]:
+                try:
+                    json.loads(active["arguments"])
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    key = ("fallback", self._next_fallback_index)
+                    self._next_fallback_index += 1
+                    return key, False
+            return self._active_key, False
+
+        key = ("fallback", self._next_fallback_index)
+        self._next_fallback_index += 1
+        return key, False
 
     def process_chunk(self, tool_calls: Optional[List[Any]]) -> List[StreamEvent]:
         events: List[StreamEvent] = []
 
         if not tool_calls:
-            if self._active_index is not None:
-                if self._active_index not in self._emitted_indices:
-                    if event := self._emit_complete_tool_call(self._active_index):
-                        events.append(event)
-                self._active_index = None
+            for key in self._pending:
+                if key not in self._emitted_keys and (event := self._emit_complete_tool_call(key)):
+                    events.append(event)
+            self._active_key = None
             return events
 
         for tc in tool_calls:
-            idx = getattr(tc, "index", 0)
+            key, has_explicit_index = self._resolve_key(tc)
 
-            if self._active_index is not None and idx != self._active_index:
-                if self._active_index not in self._emitted_indices:
-                    if event := self._emit_complete_tool_call(self._active_index):
-                        events.append(event)
+            if (
+                self._active_key is not None
+                and key != self._active_key
+                and self._pending[self._active_key].get("emit_on_switch", False)
+                and self._active_key not in self._emitted_keys
+                and (event := self._emit_complete_tool_call(self._active_key))
+            ):
+                events.append(event)
 
-            self._active_index = idx
+            self._active_key = key
 
-            if idx not in self._pending:
-                self._pending[idx] = {
+            if key not in self._pending:
+                self._pending[key] = {
                     "id": "",
                     "name": "",
                     "arguments": "",
                     "buffer": "",
+                    "emit_on_switch": has_explicit_index,
                 }
 
-            p = self._pending[idx]
+            p = self._pending[key]
 
             if tid := getattr(tc, "id", None):
                 p["id"] = tid
+                self._id_to_key[tid] = key
 
             func = getattr(tc, "function", None)
             if func is not None:
@@ -946,7 +1055,8 @@ class ToolCallStreamHandler:
         if idx not in self._pending:
             return None
         p = self._pending[idx]
-        if not p["id"] or not p["name"]:
+        name = p["name"]
+        if not name:
             return None
 
         try:
@@ -954,30 +1064,33 @@ class ToolCallStreamHandler:
         except json.JSONDecodeError:
             args = {"_raw": p["arguments"] or ""}
 
-        self._emitted_indices.add(idx)
+        self._emitted_keys.add(idx)
         return self._event_builder.tool_call({
-            "id": p["id"],
-            "name": p["name"],
+            "id": p["id"] or self._fallback_id(idx),
+            "name": name,
             "arguments": args,
-            "callable": self._tools_dict.get(p["name"]) or None,
+            "callable": self._tools_dict.get(name) or None,
         })
 
     def finalize(self) -> List[ToolCall]:
         new_calls: List[ToolCall] = []
-        if self._active_index is not None and self._active_index not in self._emitted_indices:
-            event = self._emit_complete_tool_call(self._active_index)
+        for key in self._pending:
+            if key in self._emitted_keys:
+                continue
+            event = self._emit_complete_tool_call(key)
             if event:
                 content = event.get("content")
                 if content is not None:
                     new_calls.append(content)
-        self._active_index = None
+        self._active_key = None
         return new_calls
 
     def get_all_calls(self) -> List[ToolCall]:
         result: List[ToolCall] = []
-        for idx in sorted(self._pending.keys()):
+        for idx in self._pending:
             p = self._pending[idx]
-            if not p["id"] or not p["name"]:
+            name = p["name"]
+            if not name:
                 continue
 
             try:
@@ -986,17 +1099,23 @@ class ToolCallStreamHandler:
                 args = {"_raw": p["arguments"] or ""}
 
             result.append({
-                "id": p["id"],
-                "name": p["name"],
+                "id": p["id"] or self._fallback_id(idx),
+                "name": name,
                 "arguments": args,
-                "callable": self._tools_dict.get(p["name"]) or None,
+                "callable": self._tools_dict.get(name) or None,
             })
         return result
 
+    @staticmethod
+    def _fallback_id(key: Any) -> str:
+        return f"call_{key[1]}" if isinstance(key, tuple) else f"call_{key}"
+
     def clear(self) -> None:
         self._pending.clear()
-        self._active_index = None
-        self._emitted_indices.clear()
+        self._active_key = None
+        self._emitted_keys.clear()
+        self._id_to_key.clear()
+        self._next_fallback_index = 0
 
 # ============================================================================
 # Main LLM Class
@@ -1039,20 +1158,8 @@ class LLM:
 
         self._api_base = self._compute_api_base()
 
-        self._client = OpenAI(
-            base_url=self._api_base,
-            api_key=api_key,
-            timeout=self._config.timeout,
-            default_headers=default_headers,
-            max_retries=self._config.max_retries,
-        )
-        self._async_client = AsyncOpenAI(
-            base_url=self._api_base,
-            api_key=api_key,
-            timeout=self._config.timeout,
-            default_headers=default_headers,
-            max_retries=self._config.max_retries,
-        )
+        self._client = self._new_client()
+        self._async_client = self._new_client(async_client=True)
 
         self._schema_converter = SchemaConverter()
         self._tool_preparator = ToolPreparator(self._schema_converter)
@@ -1067,6 +1174,29 @@ class LLM:
             return base
         return f"{base}/v1"
 
+    def _new_client(
+        self,
+        max_retries: Optional[int] = None,
+        *,
+        async_client: bool = False,
+    ) -> Any:
+        """Create an independent client with its own HTTP transport.
+
+        Never use ``with_options()`` for per-call overrides: it returns a
+        shallow copy sharing the main client's transport, so closing it
+        would break the long-lived client.
+        """
+        client_kwargs: Dict[str, Any] = {
+            "base_url": self._api_base,
+            "api_key": self._config.api_key,
+            "timeout": self._config.timeout,
+            "default_headers": self._config.default_headers,
+            "max_retries": self._config.max_retries if max_retries is None else max_retries,
+        }
+        if async_client:
+            return AsyncOpenAI(**client_kwargs)
+        return OpenAI(**client_kwargs)
+
     @property
     def model(self) -> str:
         return self._config.model
@@ -1078,11 +1208,17 @@ class LLM:
     def list_models(self, fallback: Optional[List[str]] = None, max_retries: Optional[int] = None,) -> List[str]:
         """Return model IDs from the configured API, or fallback/[] on failure."""
         try:
-            client = self._client if max_retries is None else self._client.with_options(max_retries=max_retries)
-            return sorted({model.id for model in client.models.list().data})
-        except Exception:
+            temp_client = max_retries is not None
+            client = self._client if not temp_client else self._new_client(max_retries=max_retries)
+            try:
+                return sorted({model.id for model in client.models.list().data})
+            finally:
+                if temp_client:
+                    client.close()
+        except Exception as e:
+            logger.warning("list_models failed, falling back: %s", e)
             return list(fallback or [])
-        
+
     async def async_list_models(
         self,
         fallback: Optional[List[str]] = None,
@@ -1090,10 +1226,16 @@ class LLM:
     ) -> List[str]:
         """Async return model IDs from the configured API, or fallback/[] on failure."""
         try:
-            client = self._async_client if max_retries is None else self._async_client.with_options(max_retries=max_retries)
-            models = await client.models.list()
-            return sorted({model.id for model in models.data})
-        except Exception:
+            temp_client = max_retries is not None
+            client = self._async_client if not temp_client else self._new_client(max_retries=max_retries, async_client=True)
+            try:
+                models = await client.models.list()
+                return sorted({model.id for model in models.data})
+            finally:
+                if temp_client:
+                    await _aclose_async_resource(client)
+        except Exception as e:
+            logger.warning("async_list_models failed, falling back: %s", e)
             return list(fallback or [])
 
     # ========================================================================
@@ -1282,6 +1424,7 @@ class LLM:
             "pending_tool_items": {},
             "pending_tool_indexes": {},
             "completed_tool_calls": [],
+            "stop_reason": None,
         }
 
     def _handle_responses_event(
@@ -1290,21 +1433,22 @@ class LLM:
         state: Dict[str, Any],
         structured_output: bool,
         hide_thinking: bool,
-        tools_dict: Dict[str,Callable],
+        tools_dict: Dict[str, Callable],
     ) -> List[StreamEvent]:
-        state["tokens"] += 1
         emitted: List[StreamEvent] = []
         etype = getattr(event, "type", "")
 
-        if etype == "response.completed":
+        if etype in ("response.completed", "response.incomplete", "response.failed"):
             response = getattr(event, "response", None)
             state["api_usage"] = self._read_usage(getattr(response, "usage", None))
+            state["stop_reason"] = self._derive_responses_stop_reason(response, state)
             return emitted
 
         if etype == "response.output_text.delta":
             chunk = getattr(event, "delta", "") or ""
             if chunk:
                 state["answer"] += chunk
+                state["tokens"] += 1
                 if not structured_output:
                     emitted.append(self._event_builder.answer(chunk))
             return emitted
@@ -1313,6 +1457,7 @@ class LLM:
             chunk = getattr(event, "delta", "") or ""
             if chunk:
                 state["thinking"] += chunk
+                state["tokens"] += 1
                 if not hide_thinking:
                     emitted.append(self._event_builder.reasoning(chunk))
             return emitted
@@ -1346,7 +1491,7 @@ class LLM:
                 if output_index is not None:
                     state["pending_tool_indexes"][int(output_index)] = pending
             return emitted
-        
+
         if etype == "response.function_call_arguments.delta":
             item_id = getattr(event, "item_id", None)
             output_index = getattr(event, "output_index", None)
@@ -1367,6 +1512,7 @@ class LLM:
                 pending = state["pending_tool_indexes"].get(int(output_index))
 
             if pending and pending.get("call_id") and pending.get("name") and delta:
+                state["tokens"] += 1
                 emitted.append(
                     self._event_builder.tool_call_part(
                         content={
@@ -1381,16 +1527,16 @@ class LLM:
         if etype == "response.function_call_arguments.done":
             item_id = getattr(event, "item_id", None)
             output_index = getattr(event, "output_index", None)
-            
+
             args_str = getattr(event, "arguments", None)
-            
+
             pending = state["pending_tool_items"].pop(item_id, {}) if item_id else {}
             if not pending and output_index is not None:
                 pending = state["pending_tool_indexes"].pop(int(output_index), {})
 
             if args_str is None:
                 args_str = pending.get("arguments", "{}") or "{}"
-            
+
             fn_name = getattr(event, "name", "") or pending.get("name", "")
 
             try:
@@ -1410,6 +1556,35 @@ class LLM:
 
         return emitted
 
+    @staticmethod
+    def _derive_responses_stop_reason(response: Any, state: Dict[str, Any]) -> Optional[str]:
+        status = getattr(response, "status", None)
+        if status == "failed":
+            return "failed"
+        if status == "cancelled":
+            return "cancelled"
+        if status == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            reason = (
+                details.get("reason")
+                if isinstance(details, dict)
+                else getattr(details, "reason", None)
+            )
+            if reason == "max_output_tokens":
+                return "length"
+            if reason == "content_filter":
+                return "content_filter"
+            return "incomplete"
+        if status == "completed":
+            return "tool_calls" if state.get("completed_tool_calls") else "stop"
+        return None
+
+    @staticmethod
+    def _normalize_stop_reason(reason: Optional[str]) -> Optional[str]:
+        if reason == "function_call":
+            return "tool_calls"
+        return reason
+
     def _finalize_responses_stream(
         self,
         state: Dict[str, Any],
@@ -1424,8 +1599,8 @@ class LLM:
         if structured_output:
             try:
                 answer = json.loads(answer)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                logger.warning("Structured output was not valid JSON, returning raw string: %s", e)
             yield self._event_builder.answer(answer)
 
         completed_tool_calls = state["completed_tool_calls"]
@@ -1446,6 +1621,7 @@ class LLM:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens if completion_tokens is not None else stream_tokens,
             "total_tokens": total_tokens,
+            "stop_reason": state["stop_reason"],
         }
 
         if verbose:
@@ -1460,6 +1636,8 @@ class LLM:
                 final_response["reasoning"] = thinking.strip()
             if completed_tool_calls:
                 final_response["tool_calls"] = completed_tool_calls
+            if state["stop_reason"]:
+                final_response["stop_reason"] = state["stop_reason"]
             if verbose:
                 final_response["verbose"] = verbose_info
             yield self._event_builder.final(final_response)
@@ -1549,24 +1727,32 @@ class LLM:
         start_time = time.perf_counter()
         latency: Optional[float] = None
 
-        client = self._client if max_retries is None else self._client.with_options(max_retries=max_retries)
+        temp_client = max_retries is not None
+        client = self._client if not temp_client else self._new_client(max_retries=max_retries)
 
         try:
             stream = client.responses.create(**kwargs)
         except Exception as e:
-            raise ModelRequestError(f"Responses API request failed: {e}")
+            if temp_client:
+                client.close()
+            raise ModelRequestError(f"Responses API request failed: {e}") from e
 
         try:
             for event in stream:
                 if latency is None:
                     latency = time.perf_counter() - start_time
                 for emitted in self._handle_responses_event(
-                    event, state, structured_output, hide_thinking,tools_dict
+                    event, state, structured_output, hide_thinking, tools_dict
                 ):
                     yield emitted
 
         except Exception as e:
             raise ModelRequestError(f"Responses API stream failed: {e}") from e
+        finally:
+            if hasattr(stream, "close"):
+                stream.close()
+            if temp_client:
+                client.close()
 
         elapsed = time.perf_counter() - start_time
         yield from self._finalize_responses_stream(
@@ -1599,7 +1785,8 @@ class LLM:
         start_time = time.perf_counter()
         latency: Optional[float] = None
 
-        client = self._async_client if max_retries is None else self._async_client.with_options(max_retries=max_retries)
+        temp_client = max_retries is not None
+        client = self._async_client if not temp_client else self._new_client(max_retries=max_retries, async_client=True)
 
         async def _acreate(c):
             call = c.responses.create(**kwargs)
@@ -1608,19 +1795,25 @@ class LLM:
         try:
             stream = await _acreate(client)
         except Exception as e:
-            raise ModelRequestError(f"Async Responses API request failed: {e}")
+            if temp_client:
+                await _aclose_async_resource(client)
+            raise ModelRequestError(f"Async Responses API request failed: {e}") from e
 
         try:
             async for event in stream:
                 if latency is None:
                     latency = time.perf_counter() - start_time
                 for emitted in self._handle_responses_event(
-                    event, state, structured_output, hide_thinking,tools_dict
+                    event, state, structured_output, hide_thinking, tools_dict
                 ):
                     yield emitted
 
         except Exception as e:
             raise ModelRequestError(f"Async Responses API stream failed: {e}") from e
+        finally:
+            await _aclose_async_resource(stream)
+            if temp_client:
+                await _aclose_async_resource(client)
 
         elapsed = time.perf_counter() - start_time
         for emitted in self._finalize_responses_stream(
@@ -1705,39 +1898,67 @@ class LLM:
         kwargs, _, structured_output = self._build_request(
             resolved_messages, output_format, tools, reasoning_effort, max_tokens, extra_body
         )
-        
+
         thinking_parser = ThinkingParser(self._config.custom_thinking_token)
-        tool_handler = ToolCallStreamHandler(self._event_builder,self._build_tools_dict(tools or []))
+        tool_handler = ToolCallStreamHandler(self._event_builder, self._build_tools_dict(tools or []))
 
         thinking = ""
         answer = ""
         start_time = time.perf_counter()
         latency: Optional[float] = None
+        stop_reason: Optional[str] = None
         tokens = 0
 
-        client = self._client if max_retries is None else self._client.with_options(max_retries=max_retries)
+        temp_client = max_retries is not None
+        client = self._client if not temp_client else self._new_client(max_retries=max_retries)
 
         def _create(c):
-            try:
-                return c.chat.completions.create(**kwargs)
-            except APIStatusError as e:
-                if "stream_options" in kwargs and e.status_code in (400, 422):
-                    kwargs_copy = dict(kwargs)
-                    kwargs_copy.pop("stream_options", None)
-                    return c.chat.completions.create(**kwargs_copy)
-                raise
+            return c.chat.completions.create(**kwargs)
 
-        try:
-            completion = _create(client)
-        except Exception as e:
-            raise ModelRequestError(f"Model request failed: {e}") from e
+        retried = False
+        completion = None
+        while completion is None:
+            try:
+                completion = _create(client)
+            except APIStatusError as e:
+                if not retried and "stream_options" in kwargs and e.status_code in (400, 422):
+                    kwargs = {k: v for k, v in kwargs.items() if k != "stream_options"}
+                    retried = True
+                    continue
+                if temp_client:
+                    client.close()
+                raise ModelRequestError(f"Model request failed: {e}") from e
+            except Exception as e:
+                if temp_client:
+                    client.close()
+                raise ModelRequestError(f"Model request failed: {e}") from e
 
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
 
         try:
-            for chunk in completion:
+            iterator = iter(completion)
+            while True:
+                try:
+                    chunk = next(iterator)
+                except StopIteration:
+                    break
+                except APIStatusError as e:
+                    if (
+                        not retried
+                        and "stream_options" in kwargs
+                        and e.status_code in (400, 422)
+                    ):
+                        if hasattr(completion, "close"):
+                            completion.close()
+                        kwargs = {k: v for k, v in kwargs.items() if k != "stream_options"}
+                        retried = True
+                        completion = _create(client)
+                        iterator = iter(completion)
+                        continue
+                    raise
+
                 if latency is None:
                     latency = time.perf_counter() - start_time
 
@@ -1753,7 +1974,11 @@ class LLM:
                 if not chunk.choices:
                     continue
 
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                if getattr(choice, "finish_reason", None):
+                    stop_reason = self._normalize_stop_reason(choice.finish_reason)
+
+                delta = choice.delta
                 if not delta:
                     continue
 
@@ -1782,6 +2007,11 @@ class LLM:
                     yield event
         except Exception as e:
             raise ModelRequestError(f"Model stream failed: {e}") from e
+        finally:
+            if hasattr(completion, "close"):
+                completion.close()
+            if temp_client:
+                client.close()
 
         elapsed = time.perf_counter() - start_time
         if completion_tokens > 0:
@@ -1791,8 +2021,8 @@ class LLM:
         if structured_output:
             try:
                 answer = json.loads(answer)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                logger.warning("Structured output was not valid JSON, returning raw string: %s", e)
             yield self._event_builder.answer(answer)
 
         final_tool_calls = tool_handler.finalize()
@@ -1806,6 +2036,7 @@ class LLM:
             "prompt_tokens": prompt_tokens if prompt_tokens > 0 else None,
             "completion_tokens": completion_tokens if completion_tokens > 0 else None,
             "total_tokens": total_tokens if total_tokens > 0 else None,
+            "stop_reason": stop_reason,
         }
 
         if verbose:
@@ -1820,6 +2051,8 @@ class LLM:
             all_completed_calls = tool_handler.get_all_calls()
             if all_completed_calls:
                 final_response["tool_calls"] = all_completed_calls
+            if stop_reason:
+                final_response["stop_reason"] = stop_reason
             if verbose:
                 final_response["verbose"] = verbose_info
 
@@ -1917,33 +2150,59 @@ class LLM:
         answer = ""
         start_time = time.perf_counter()
         latency: Optional[float] = None
+        stop_reason: Optional[str] = None
         tokens = 0
 
-        client = self._async_client if max_retries is None else self._async_client.with_options(max_retries=max_retries)
+        temp_client = max_retries is not None
+        client = self._async_client if not temp_client else self._new_client(max_retries=max_retries, async_client=True)
 
         async def _acreate(c):
-            try:
-                call = c.chat.completions.create(**kwargs)
-                return await call if asyncio.iscoroutine(call) else call
-            except APIStatusError as e:
-                if "stream_options" in kwargs and e.status_code in (400, 422):
-                    kwargs_copy = dict(kwargs)
-                    kwargs_copy.pop("stream_options", None)
-                    call = c.chat.completions.create(**kwargs_copy)
-                    return await call if asyncio.iscoroutine(call) else call
-                raise
+            call = c.chat.completions.create(**kwargs)
+            return await call if asyncio.iscoroutine(call) else call
 
-        try:
-            completion = await _acreate(client)
-        except Exception as e:
-            raise ModelRequestError(f"Async model request failed: {e}") from e
+        retried = False
+        completion = None
+        while completion is None:
+            try:
+                completion = await _acreate(client)
+            except APIStatusError as e:
+                if not retried and "stream_options" in kwargs and e.status_code in (400, 422):
+                    kwargs = {k: v for k, v in kwargs.items() if k != "stream_options"}
+                    retried = True
+                    continue
+                if temp_client:
+                    await _aclose_async_resource(client)
+                raise ModelRequestError(f"Async model request failed: {e}") from e
+            except Exception as e:
+                if temp_client:
+                    await _aclose_async_resource(client)
+                raise ModelRequestError(f"Async model request failed: {e}") from e
 
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
 
         try:
-            async for chunk in completion:
+            iterator = completion.__aiter__()
+            while True:
+                try:
+                    chunk = await anext(iterator)
+                except StopAsyncIteration:
+                    break
+                except APIStatusError as e:
+                    if (
+                        not retried
+                        and "stream_options" in kwargs
+                        and e.status_code in (400, 422)
+                    ):
+                        await _aclose_async_resource(completion)
+                        kwargs = {k: v for k, v in kwargs.items() if k != "stream_options"}
+                        retried = True
+                        completion = await _acreate(client)
+                        iterator = completion.__aiter__()
+                        continue
+                    raise
+
                 if latency is None:
                     latency = time.perf_counter() - start_time
 
@@ -1959,7 +2218,11 @@ class LLM:
                 if not chunk.choices:
                     continue
 
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                if getattr(choice, "finish_reason", None):
+                    stop_reason = self._normalize_stop_reason(choice.finish_reason)
+
+                delta = choice.delta
                 if not delta:
                     continue
 
@@ -1988,6 +2251,10 @@ class LLM:
                     yield event
         except Exception as e:
             raise ModelRequestError(f"Async model stream failed: {e}") from e
+        finally:
+            await _aclose_async_resource(completion)
+            if temp_client:
+                await _aclose_async_resource(client)
 
         elapsed = time.perf_counter() - start_time
         if completion_tokens > 0:
@@ -1997,8 +2264,8 @@ class LLM:
         if structured_output:
             try:
                 answer = json.loads(answer)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                logger.warning("Structured output was not valid JSON, returning raw string: %s", e)
             yield self._event_builder.answer(answer)
 
         final_tool_calls = tool_handler.finalize()
@@ -2012,6 +2279,7 @@ class LLM:
             "prompt_tokens": prompt_tokens if prompt_tokens > 0 else None,
             "completion_tokens": completion_tokens if completion_tokens > 0 else None,
             "total_tokens": total_tokens if total_tokens > 0 else None,
+            "stop_reason": stop_reason,
         }
 
         if verbose:
@@ -2023,10 +2291,11 @@ class LLM:
             }
             if not hide_thinking and thinking.strip():
                 final_response["reasoning"] = thinking.strip()
-            
             all_completed_calls = tool_handler.get_all_calls()
             if all_completed_calls:
                 final_response["tool_calls"] = all_completed_calls
+            if stop_reason:
+                final_response["stop_reason"] = stop_reason
             if verbose:
                 final_response["verbose"] = verbose_info
 
@@ -2039,16 +2308,20 @@ class LLM:
     # ========================================================================
 
     def close(self) -> None:
-        if hasattr(self._client, "close"):
-            self._client.close()
-        _close_async_resource(self._async_client)
+        try:
+            if hasattr(self._client, "close"):
+                self._client.close()
+        finally:
+            _close_async_resource(self._async_client)
 
     async def aclose(self) -> None:
-        if hasattr(self._client, "close"):
-            self._client.close()
-        close_result = self._async_client.close()
-        if inspect.isawaitable(close_result):
-            await close_result
+        try:
+            if hasattr(self._client, "close"):
+                self._client.close()
+        finally:
+            close_result = self._async_client.close()
+            if inspect.isawaitable(close_result):
+                await close_result
 
     def __enter__(self):
         return self
@@ -2063,7 +2336,14 @@ class LLM:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.aclose()
         return False
-    
+
+def _norm_api_base(url: str) -> str:
+    base = url.rstrip("/")
+    if re.search(r"/v\d+$", base):
+        return base
+    return f"{base}/v1"
+
+
 def list_models(
     fallback: Optional[List[str]] = None,
     max_retries: int = 3,
@@ -2072,34 +2352,28 @@ def list_models(
     base_url: Optional[str] = None,
 ) -> List[str]:
     """Return model IDs from the configured API, or fallback/[] on failure."""
-    a_k = ""
-    b_u = ""
-    manually = base_url is not None or api_key is not None
-    if client and not manually:
-        a_k = client._client.api_key
-        b_u = client._api_base
-    elif manually and not client:
-        if not (base_url and api_key):
-            raise ValueError("If client is not provided, both api_key and base_url must be provided.")
-        a_k = api_key
-        b_u = base_url
-    elif not manually and not client:
-        raise ValueError("Either a client must be provided, or both api_key and base_url must be provided.")
-    elif client and manually:
-        if base_url is not None and base_url != client._api_base:
-            raise ValueError("If client is provided, base_url must match the client's configuration or be None.")
-        if api_key is not None and api_key != client._client.api_key:
-            raise ValueError("If client is provided, api_key must match the client's configuration or be None.")
-        a_k = client._client.api_key
-        b_u = client._api_base
+    if client is not None:
+        resolved_key = client._client.api_key
+        resolved_base = client._api_base
+        if api_key is not None and api_key != resolved_key:
+            raise ValueError("api_key must match the client's configuration or be None")
+        if base_url is not None and _norm_api_base(base_url) != _norm_api_base(resolved_base):
+            raise ValueError("base_url must match the client's configuration or be None")
+    else:
+        resolved_key = api_key if api_key is not None else DEFAULT_API_KEY
+        resolved_base = _norm_api_base(base_url) if base_url is not None else DEFAULT_BASE_URL
     try:
-        c = OpenAI(api_key=a_k, base_url=b_u,max_retries=max_retries)
-        models = c.models.list()
-        return sorted({model.id for model in models.data}) or list(fallback or [])
-    except Exception:
+        c = OpenAI(api_key=resolved_key, base_url=resolved_base, max_retries=max_retries)
+        try:
+            models = c.models.list()
+            return sorted({model.id for model in models.data}) or list(fallback or [])
+        finally:
+            c.close()
+    except Exception as e:
+        logger.warning("list_models failed, falling back: %s", e)
         return list(fallback or [])
-        
-        
+
+
 async def async_list_models(
     fallback: Optional[List[str]] = None,
     max_retries: int = 3,
@@ -2108,34 +2382,27 @@ async def async_list_models(
     base_url: Optional[str] = None,
 ) -> List[str]:
     """Async version of list_models."""
-    a_k = ""
-    b_u = ""
-    manually = base_url is not None or api_key is not None
-    if client and not manually:
-        a_k = client._client.api_key
-        b_u = client._api_base
-    elif manually and not client:
-        if not (base_url and api_key):
-            raise ValueError("If client is not provided, both api_key and base_url must be provided.")
-        a_k = api_key
-        b_u = base_url
-    elif not manually and not client:
-        raise ValueError("Either a client must be provided, or both api_key and base_url must be provided.")
-    elif client and manually:
-        if base_url is not None and base_url != client._api_base:
-            raise ValueError("If client is provided, base_url must match the client's configuration or be None.")
-        if api_key is not None and api_key != client._client.api_key:
-            raise ValueError("If client is provided, api_key must match the client's configuration or be None.")
-        a_k = client._client.api_key
-        b_u = client._api_base
+    if client is not None:
+        resolved_key = client._client.api_key
+        resolved_base = client._api_base
+        if api_key is not None and api_key != resolved_key:
+            raise ValueError("api_key must match the client's configuration or be None")
+        if base_url is not None and _norm_api_base(base_url) != _norm_api_base(resolved_base):
+            raise ValueError("base_url must match the client's configuration or be None")
+    else:
+        resolved_key = api_key if api_key is not None else DEFAULT_API_KEY
+        resolved_base = _norm_api_base(base_url) if base_url is not None else DEFAULT_BASE_URL
     try:
-        c = AsyncOpenAI(api_key=a_k, base_url=b_u,max_retries=max_retries)
-        models = await c.models.list()
-        return sorted({model.id for model in models.data}) or list(fallback or [])
-    except Exception:
+        c = AsyncOpenAI(api_key=resolved_key, base_url=resolved_base, max_retries=max_retries)
+        try:
+            models = await c.models.list()
+            return sorted({model.id for model in models.data}) or list(fallback or [])
+        finally:
+            await _aclose_async_resource(c)
+    except Exception as e:
+        logger.warning("async_list_models failed, falling back: %s", e)
         return list(fallback or [])
-        
-        
+
 
 # ============================================================================
 # Public API
@@ -2153,6 +2420,7 @@ __all__ = [
     "AssistantMessage",
     "assistant_message",
     "user_message",
+    "system_message",
     "tool_result",
     "FinalResponse",
     "VerboseInfo",
@@ -2163,4 +2431,5 @@ __all__ = [
     "ModelRequestError",
     "list_models",
     "async_list_models",
+    "__version__",
 ]
