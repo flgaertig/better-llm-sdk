@@ -1,3 +1,5 @@
+
+
 # 📦 llm-sdk
 
 Small Python SDK for OpenAI-compatible LLM APIs.
@@ -20,6 +22,8 @@ One file, clean API, boring on purpose. Use it with local servers, OpenAI-style 
 - Lightweight verbose stats for streams
 
 ## 🚀 Get Started
+
+Requires Python 3.10+.
 
 Install the package directly from PyPI:
 
