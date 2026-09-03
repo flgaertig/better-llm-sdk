@@ -2,7 +2,7 @@
 
 Small Python SDK for OpenAI-compatible LLM APIs.
 
-One file, clean API, boring on purpose. Use it with local servers, OpenAI-style endpoints, structured output, tool calls, vision inputs, and reasoning streams.
+One file, clean API, boring on purpose. Use it with local servers, OpenAI-style endpoints, structured output, tool calls, multimodal inputs, and reasoning streams.
 
 <img width="1280" height="640" alt="main" src="https://github.com/user-attachments/assets/49f08e18-b6ae-4948-ab17-af18e329c6ec" />
 
@@ -16,7 +16,8 @@ One file, clean API, boring on purpose. Use it with local servers, OpenAI-style 
 - Structured output from JSON schema or typed Python classes
 - Tool schema generation from Python callables
 - Vision input normalization from URL, path, base64, or PIL image
-- Thinking/reasoning token parsing
+- Audio, video & file inputs with the same path/base64/URL pattern
+- Reasoning token parsing
 - Lightweight verbose stats for streams
 
 ## 🚀 Get Started
@@ -49,7 +50,7 @@ response = llm.response(system="You're a helpful assistant!",input="Write a tiny
 print(response["answer"])
 ```
 
-By default, `base_url="http://localhost:1234/v1"` and `api_key="lm-studio"`, so local LM Studio-style servers work with very little setup.
+By default, `base_url="http://localhost:1234/v1"` and `api_key="lm-studio"`, so local LM Studio-style servers just work. `base_url` must be http(s) without credentials; `?api-version=`-style queries are fine.
 
 All inference methods accept either `input="..."` for the common single-user-message case or a Chat Completions-style message list + `system` for a system prompt:
 
@@ -72,23 +73,25 @@ Events are small dictionaries:
 ```python
 {"type": "answer", "content": "..."}
 {"type": "reasoning", "content": "..."}
+{"type": "refusal", "content": "..."}
 {"type": "tool_call", "content": {"id": "...", "name": "...", "arguments": {...}, "callable": Callable}}
 {"type": "tool_call_part", "content": {"id": "...", "name": "...", "args_delta": "{\"city\": \"Berlin\"}"}}
-{"type": "verbose", "content": {"tokens": 42, "tokens_per_second": 91.3, "latency": 0.2, "prompt_tokens": 10, "completion_tokens": 32, "total_tokens": 42, "stop_reason": "stop"}}
-{"type": "final", "content": {"answer": "...", "stop_reason": "stop"}}
-{"type": "done"}
+{"type": "verbose", "content": {"tokens": 42, "chunks": 42, "tokens_per_second": 91.3, "latency": 0.2, "prompt_tokens": 10, "completion_tokens": 32, "total_tokens": 42, "stop_reason": "stop"}}
+{"type": "final", "content": {"answer": "...", "reasoning": "...", "stop_reason": "stop"}}
+{"type": "done", "content": None}
 ```
 
-Use `final=True` if you also want a final aggregated response event.
+Use `final=True` for a final aggregated event. Reasoning is included by default; `include_reasoning=False` hides it.
 
 ## ⏱️ Async
 
 ```python
 import asyncio
+import os
 from llm_sdk import LLM
 
 async def main():
-    async with LLM(model="gpt-5.5", api_key="sk-...", base_url="https://api.openai.com/v1", use_responses_api=True) as llm:
+    async with LLM(model="gpt-5.5", api_key=os.environ["OPENAI_API_KEY"], base_url="https://api.openai.com/v1", use_responses_api=True) as llm:
         response = await llm.async_response(input="Give me a crisp project name.")
         print(response["answer"])
 
@@ -107,7 +110,7 @@ llm.response(input="...", max_retries=0)
 
 ## 📐 Structured Output
 
-Pass a JSON schema or a typed class. Classes are converted into OpenAI-compatible JSON schema (including enums, literals, and optional fields).
+Pass a JSON schema or a typed class (enums, literals, optional fields included). Parsing is always strict: bad JSON raises `StructuredOutputError` (original text in `.raw`).
 
 ```python
 class Verdict:
@@ -150,7 +153,8 @@ from llm_sdk import assistant_message, system_message, tool_result, user_message
 # 0. Optional system message
 msg0 = system_message("You are a helpful assistant.")
 
-# 1. Format the assistant's response (includes both answer text and tool calls)
+# 1. Format the assistant's response (includes both answer text and tool calls;
+#    reasoning is dropped by default — pass include_reasoning=True to keep it)
 msg1 = assistant_message(response)
 
 # 2. Format a tool call execution result
@@ -159,6 +163,8 @@ msg2 = tool_result(response["tool_calls"][0], "result string or dict")
 # 3. Format subsequent user messages
 msg3 = user_message("Tell me more about the results.")
 ```
+
+In Responses mode, `assistant_message(response)` also carries `response_items`, so the next turn replays correctly — just append it.
 
 
 ## 👁️ Vision
@@ -183,23 +189,40 @@ Supported image forms include:
 - `{"type": "image", "image_path": "local-file.png"}`
 - `{"type": "image", "image_base64": "..."}` (MIME type auto-detected from the bytes)
 - `{"type": "image", "image_pil": image}`
+- plus optional `detail` (`low`/`high`/`auto`; `original` is Responses-only)
+
+Local paths (`str` or `pathlib.Path`) just work. Oversized images shrink automatically instead of failing.
+
+## 🎞️ Audio, Video & Files
+
+Same pattern for other modalities (input only):
+
+- Audio: `{"type": "audio", "audio_path": "clip.wav"}` (also `audio_base64`, `audio_url`) → `input_audio` (wav/mp3/aiff/aac/ogg/flac/m4a, max 25MB; OpenAI itself takes wav/mp3 only)
+- Video: `{"type": "video", "video_path": "clip.mp4"}` (also `video_base64`, `video_url`, optional `processing`) → `video_url` (mp4/mov/webm, max 100MB)
+- File: `{"type": "file", "file_path": "doc.pdf"}` (also `file_base64`, `file_url`, `file_id`, optional `filename`/`detail`) → `file` part (max 50MB inline; `detail` is Responses-only)
+
+Remote URLs pass through untouched (http(s) only, no credentials). Bad content raises `Image/Audio/Video/FileProcessingError`; bad types/URLs raise `ConfigurationError`.
 
 ## 🔌 Responses API
 
 Use `use_responses_api=True` for endpoints that prefer OpenAI's Responses API shape.
 
 ```python
+import os
+
 llm = LLM(
     model="gpt-5.5",
-    api_key="sk-...",
+    api_key=os.environ["OPENAI_API_KEY"],
     base_url="https://api.openai.com/v1",
     use_responses_api=True,
 )
 ```
 
+Remote files map to `input_file` with `file_url`, uploads via `file_id`. Limits: no video, no remote audio URLs (base64 `input_audio` only) – both raise `ConfigurationError`.
+
 ## 🧠 Reasoning Effort
 
-Use `reasoning_effort="high"` to set the model's reasoning effort.
+Use `reasoning_effort="high"` — or `reasoning_budget=2000` for a token budget (mutually exclusive). Unknown values pass through with a warning.
 
 ```python
 response = llm.response(
@@ -215,11 +238,18 @@ response = llm.response(
 - `input="..."` or `messages=[...]` for all inference methods
 - `LLM.list_models(...)` / `LLM.async_list_models(...)` and standalone `list_models(...)` / `async_list_models(...)`
 - `max_retries=3` globally on `LLM(...)` or per call
-- `reasoning_effort="low|medium|high"` where supported
-- `hide_thinking=False` to stream/return reasoning content
-- `CustomThinkingToken(...)` for custom `<think>`-style parsing
-- `verbose=True` for token-ish stream stats (incl. `stop_reason`)
-- `stop_reason` in final responses: `"stop" | "length" | "tool_calls" | "content_filter"` (and `"failed"`/`"cancelled"`/`"incomplete"` from the Responses API)
+- `reasoning_effort="high"` where supported (`reasoning_budget=N` as token-budget alternative; mutually exclusive)
+- `temperature/top_p/max_tokens/stop/seed/user/tool_choice/store/extra_body` per call (`seed`/`stop` ignored with a warning in Responses mode)
+- `extra_body` bypasses validation (escape hatch); `model`/`messages`/`input`/`stream` are rejected. On `api.openai.com` reasoning models, `stop`/`temperature`/`top_p` are dropped and `max_tokens` maps to `max_completion_tokens`
+- `schema_strict=False` relaxes the generated schema only (fewer `required`) – parsing stays strict
+- `LLMConfig(...)` + `LLM.from_config(config)` for config-object style; `default_stop_sequences=[...]`; `normalize_base_url=False` keeps `base_url` as given
+- `configure_debug_logging()` / `configure_quiet_logging()` for explicit log control (beyond `debug=True`)
+- `include_reasoning=False` to hide reasoning content (shown by default)
+- `max_image_side=8192` caps the longest image side (`None` disables, byte budget still applies)
+- `CustomReasoningPattern(...)` for custom `<think>`-style parsing
+- `verbose=True` for stream stats (incl. `stop_reason`); without server `usage`, `tokens` falls back to chunk count
+- `debug=True` for SDK debug logs (quiet by default)
+- `stop_reason`: `"stop" | "length" | "tool_calls" | "content_filter" | "refusal"` (plus `"failed"`/`"cancelled"`/`"incomplete"` in Responses mode)
 - message helpers: `system_message(...)`, `user_message(...)`, `assistant_message(...)`, `tool_result(...)`
 - `with LLM(...) as llm:` / `async with LLM(...) as llm:` for cleanup
 - `from llm_sdk import __version__` for the package version
